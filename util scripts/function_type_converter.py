@@ -133,8 +133,6 @@ def define_zig_fn_param(param_def_raw:str):
         param_name = param_def[last_space_location+1:]
         param_type = param_def[0:last_space_location]
 
-        print(param_type)
-
         formatted_param = f"{param_name}: {TYPE_LKUP[param_type]}"
         formatted_param_list.append(formatted_param)
 
@@ -144,6 +142,7 @@ def main():
 
     zig_fn_type_list = []
     zig_fn_table_fn_list = []
+    zig_fn_table_initialization_list = []
     
     for fn_def in FN_LIST:
         fn_type, fn_name, param_def = fn_def.split("(")
@@ -157,6 +156,9 @@ def main():
 
         zig_fn_table_fn_def = f"{zig_fn_name[1:]}: {zig_fn_name} = undefined,"
         zig_fn_table_fn_list.append(zig_fn_table_fn_def)
+
+        zig_fn_table_initialization = f".{zig_fn_name[1:]} = dll.lookup({zig_fn_name}, \"{zig_fn_name[1:]}\") orelse return error.Missing_{zig_fn_name},"
+        zig_fn_table_initialization_list.append(zig_fn_table_initialization)
 
     with open("SunVox Function Definition.txt", "a") as f:
         f.seek(0)
@@ -172,6 +174,12 @@ def main():
         for zig_fn_table_fn in zig_fn_table_fn_list:
             f.write(f"    {zig_fn_table_fn}\n")
         f.write("};")
+
+        f.write("\n")
+        f.write("DLL Function Table Initialization:\n\n")
+        for zig_fn_table_initialization in zig_fn_table_initialization_list:
+            f.write(f"    {zig_fn_table_initialization}\n")
+
 
     f.close()
 

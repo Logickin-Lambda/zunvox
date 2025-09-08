@@ -1,8 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
-// function table and types
+const expectEqual = std.testing.expectEqual;
+
+// ______________________________________________________________________________________________________________________
+//                                                                                                                      /
+// function table, types and Lookups                                                                                   /
+// ___________________________________________________________________________________________________________________/
+//
 // They won't be exposed at the user level since the convention is not native to the user end.
 // Users will use the functions as the type SunVox instead which is more idiomatic to zig practice.
+//
 const tsv_audio_callback = *const fn (buf: *anyopaque, frames: c_int, latency: c_int, out_time: c_uint) callconv(.c) c_int;
 const tsv_audio_callback2 = *const fn (buf: *anyopaque, frames: c_int, latency: c_int, out_time: c_uint, in_type: c_int, in_channels: c_int, in_buf: *anyopaque) callconv(.c) c_int;
 const tsv_open_slot = *const fn (slot: c_int) callconv(.c) c_int;
@@ -197,31 +205,209 @@ const SunVoxFunctionTable = struct {
     sv_get_log: tsv_get_log = undefined,
 };
 
-// The following code are usable from the user perspective, offering a more idiomatic experience to use the SunVox Lib:
-/// To be defined
-const Note = struct {};
+// Here are the list of errors for the library, to replace the negative value used for the original library
+// so that to provide a clearer ideas of what goes wrong with your projects
+const SvError = error{
+    FailedToInitizeGlobalSoundSystem,
+    FailedToCraeteSunVoxInstance,
+    MaximumInstancesExceeded,
+};
+
+/// The original library requires the user to specify the sunvox instance ID (aka slot_id)
+/// created by the sv_init() function, but to prevent users accidentally modify the id,
+/// this type is created.
+const SunVoxPrivateField = struct {
+    instance_id: u4, // The original library capped the number of slots at 16
+};
+
+const SunVoxVersion = packed union {
+    raw: u32,
+    detail: packed struct {
+        bug_fix: u8,
+        minor: u8,
+        major: u16,
+    },
+};
 
 var sv: SunVoxFunctionTable = undefined;
 var dll: std.DynLib = undefined;
+var instance_tracker = std.mem.zeroes([16]bool);
 
-/// This is the original load_dll() function, but because of the zig naming convention,
-/// the sv_init() will be replaced by zv.SunVox.CreateInstance()
-pub fn init() !void {
+// ______________________________________________________________________________________________________________________
+//                                                                                                                      /
+// Public Functions                                                                                                    /
+// ___________________________________________________________________________________________________________________/
+//
+// The following code are available from the user perspective, offering a more idiomatic experience to use the SunVox Lib:
+//
+/// To be defined
+pub const Note = extern struct {
+    note: u8,
+    vel: u8,
+    module: u16,
+    ctl: u16,
+    ctl_vel: u16,
+};
+
+/// This combines the original sv_load_dll() and sv_init() function because
+/// these two functions are mandatory for putting the dynamic library in action
+pub fn init(config: ?[]u8, freq: u16, channels: u16, flags: u32) !SunVoxVersion {
     dll = try std.DynLib.open("sunvox");
     sv = SunVoxFunctionTable{
-        .sv_init = dll.lookup(tsv_init, "sv_init") orelse return error.MissingMethod,
+        .sv_audio_callback = dll.lookup(tsv_audio_callback, "sv_audio_callback") orelse return error.Missing_tsv_audio_callback,
+        .sv_audio_callback2 = dll.lookup(tsv_audio_callback2, "sv_audio_callback2") orelse return error.Missing_tsv_audio_callback2,
+        .sv_open_slot = dll.lookup(tsv_open_slot, "sv_open_slot") orelse return error.Missing_tsv_open_slot,
+        .sv_close_slot = dll.lookup(tsv_close_slot, "sv_close_slot") orelse return error.Missing_tsv_close_slot,
+        .sv_lock_slot = dll.lookup(tsv_lock_slot, "sv_lock_slot") orelse return error.Missing_tsv_lock_slot,
+        .sv_unlock_slot = dll.lookup(tsv_unlock_slot, "sv_unlock_slot") orelse return error.Missing_tsv_unlock_slot,
+        .sv_init = dll.lookup(tsv_init, "sv_init") orelse return error.Missing_tsv_init,
+        .sv_deinit = dll.lookup(tsv_deinit, "sv_deinit") orelse return error.Missing_tsv_deinit,
+        .sv_get_sample_rate = dll.lookup(tsv_get_sample_rate, "sv_get_sample_rate") orelse return error.Missing_tsv_get_sample_rate,
+        .sv_update_input = dll.lookup(tsv_update_input, "sv_update_input") orelse return error.Missing_tsv_update_input,
+        .sv_load = dll.lookup(tsv_load, "sv_load") orelse return error.Missing_tsv_load,
+        .sv_load_from_memory = dll.lookup(tsv_load_from_memory, "sv_load_from_memory") orelse return error.Missing_tsv_load_from_memory,
+        .sv_save = dll.lookup(tsv_save, "sv_save") orelse return error.Missing_tsv_save,
+        .sv_save_to_memory = dll.lookup(tsv_save_to_memory, "sv_save_to_memory") orelse return error.Missing_tsv_save_to_memory,
+        .sv_play = dll.lookup(tsv_play, "sv_play") orelse return error.Missing_tsv_play,
+        .sv_play_from_beginning = dll.lookup(tsv_play_from_beginning, "sv_play_from_beginning") orelse return error.Missing_tsv_play_from_beginning,
+        .sv_stop = dll.lookup(tsv_stop, "sv_stop") orelse return error.Missing_tsv_stop,
+        .sv_pause = dll.lookup(tsv_pause, "sv_pause") orelse return error.Missing_tsv_pause,
+        .sv_resume = dll.lookup(tsv_resume, "sv_resume") orelse return error.Missing_tsv_resume,
+        .sv_sync_resume = dll.lookup(tsv_sync_resume, "sv_sync_resume") orelse return error.Missing_tsv_sync_resume,
+        .sv_set_autostop = dll.lookup(tsv_set_autostop, "sv_set_autostop") orelse return error.Missing_tsv_set_autostop,
+        .sv_get_autostop = dll.lookup(tsv_get_autostop, "sv_get_autostop") orelse return error.Missing_tsv_get_autostop,
+        .sv_end_of_song = dll.lookup(tsv_end_of_song, "sv_end_of_song") orelse return error.Missing_tsv_end_of_song,
+        .sv_rewind = dll.lookup(tsv_rewind, "sv_rewind") orelse return error.Missing_tsv_rewind,
+        .sv_volume = dll.lookup(tsv_volume, "sv_volume") orelse return error.Missing_tsv_volume,
+        .sv_set_event_t = dll.lookup(tsv_set_event_t, "sv_set_event_t") orelse return error.Missing_tsv_set_event_t,
+        .sv_send_event = dll.lookup(tsv_send_event, "sv_send_event") orelse return error.Missing_tsv_send_event,
+        .sv_get_current_line = dll.lookup(tsv_get_current_line, "sv_get_current_line") orelse return error.Missing_tsv_get_current_line,
+        .sv_get_current_line2 = dll.lookup(tsv_get_current_line2, "sv_get_current_line2") orelse return error.Missing_tsv_get_current_line2,
+        .sv_get_current_signal_level = dll.lookup(tsv_get_current_signal_level, "sv_get_current_signal_level") orelse return error.Missing_tsv_get_current_signal_level,
+        .sv_get_song_name = dll.lookup(tsv_get_song_name, "sv_get_song_name") orelse return error.Missing_tsv_get_song_name,
+        .sv_set_song_name = dll.lookup(tsv_set_song_name, "sv_set_song_name") orelse return error.Missing_tsv_set_song_name,
+        .sv_get_song_bpm = dll.lookup(tsv_get_song_bpm, "sv_get_song_bpm") orelse return error.Missing_tsv_get_song_bpm,
+        .sv_get_song_tpl = dll.lookup(tsv_get_song_tpl, "sv_get_song_tpl") orelse return error.Missing_tsv_get_song_tpl,
+        .sv_get_song_length_frames = dll.lookup(tsv_get_song_length_frames, "sv_get_song_length_frames") orelse return error.Missing_tsv_get_song_length_frames,
+        .sv_get_song_length_lines = dll.lookup(tsv_get_song_length_lines, "sv_get_song_length_lines") orelse return error.Missing_tsv_get_song_length_lines,
+        .sv_get_time_map = dll.lookup(tsv_get_time_map, "sv_get_time_map") orelse return error.Missing_tsv_get_time_map,
+        .sv_new_module = dll.lookup(tsv_new_module, "sv_new_module") orelse return error.Missing_tsv_new_module,
+        .sv_remove_module = dll.lookup(tsv_remove_module, "sv_remove_module") orelse return error.Missing_tsv_remove_module,
+        .sv_connect_module = dll.lookup(tsv_connect_module, "sv_connect_module") orelse return error.Missing_tsv_connect_module,
+        .sv_disconnect_module = dll.lookup(tsv_disconnect_module, "sv_disconnect_module") orelse return error.Missing_tsv_disconnect_module,
+        .sv_load_module = dll.lookup(tsv_load_module, "sv_load_module") orelse return error.Missing_tsv_load_module,
+        .sv_load_module_from_memory = dll.lookup(tsv_load_module_from_memory, "sv_load_module_from_memory") orelse return error.Missing_tsv_load_module_from_memory,
+        .sv_sampler_load = dll.lookup(tsv_sampler_load, "sv_sampler_load") orelse return error.Missing_tsv_sampler_load,
+        .sv_sampler_load_from_memory = dll.lookup(tsv_sampler_load_from_memory, "sv_sampler_load_from_memory") orelse return error.Missing_tsv_sampler_load_from_memory,
+        .sv_sampler_par = dll.lookup(tsv_sampler_par, "sv_sampler_par") orelse return error.Missing_tsv_sampler_par,
+        .sv_metamodule_load = dll.lookup(tsv_metamodule_load, "sv_metamodule_load") orelse return error.Missing_tsv_metamodule_load,
+        .sv_metamodule_load_from_memory = dll.lookup(tsv_metamodule_load_from_memory, "sv_metamodule_load_from_memory") orelse return error.Missing_tsv_metamodule_load_from_memory,
+        .sv_vplayer_load = dll.lookup(tsv_vplayer_load, "sv_vplayer_load") orelse return error.Missing_tsv_vplayer_load,
+        .sv_vplayer_load_from_memory = dll.lookup(tsv_vplayer_load_from_memory, "sv_vplayer_load_from_memory") orelse return error.Missing_tsv_vplayer_load_from_memory,
+        .sv_get_number_of_modules = dll.lookup(tsv_get_number_of_modules, "sv_get_number_of_modules") orelse return error.Missing_tsv_get_number_of_modules,
+        .sv_find_module = dll.lookup(tsv_find_module, "sv_find_module") orelse return error.Missing_tsv_find_module,
+        .sv_get_module_flags = dll.lookup(tsv_get_module_flags, "sv_get_module_flags") orelse return error.Missing_tsv_get_module_flags,
+        .sv_get_module_inputs = dll.lookup(tsv_get_module_inputs, "sv_get_module_inputs") orelse return error.Missing_tsv_get_module_inputs,
+        .sv_get_module_outputs = dll.lookup(tsv_get_module_outputs, "sv_get_module_outputs") orelse return error.Missing_tsv_get_module_outputs,
+        .sv_get_module_type = dll.lookup(tsv_get_module_type, "sv_get_module_type") orelse return error.Missing_tsv_get_module_type,
+        .sv_get_module_name = dll.lookup(tsv_get_module_name, "sv_get_module_name") orelse return error.Missing_tsv_get_module_name,
+        .sv_set_module_name = dll.lookup(tsv_set_module_name, "sv_set_module_name") orelse return error.Missing_tsv_set_module_name,
+        .sv_get_module_xy = dll.lookup(tsv_get_module_xy, "sv_get_module_xy") orelse return error.Missing_tsv_get_module_xy,
+        .sv_set_module_xy = dll.lookup(tsv_set_module_xy, "sv_set_module_xy") orelse return error.Missing_tsv_set_module_xy,
+        .sv_get_module_color = dll.lookup(tsv_get_module_color, "sv_get_module_color") orelse return error.Missing_tsv_get_module_color,
+        .sv_set_module_color = dll.lookup(tsv_set_module_color, "sv_set_module_color") orelse return error.Missing_tsv_set_module_color,
+        .sv_get_module_finetune = dll.lookup(tsv_get_module_finetune, "sv_get_module_finetune") orelse return error.Missing_tsv_get_module_finetune,
+        .sv_set_module_finetune = dll.lookup(tsv_set_module_finetune, "sv_set_module_finetune") orelse return error.Missing_tsv_set_module_finetune,
+        .sv_set_module_relnote = dll.lookup(tsv_set_module_relnote, "sv_set_module_relnote") orelse return error.Missing_tsv_set_module_relnote,
+        .sv_get_module_scope2 = dll.lookup(tsv_get_module_scope2, "sv_get_module_scope2") orelse return error.Missing_tsv_get_module_scope2,
+        .sv_module_curve = dll.lookup(tsv_module_curve, "sv_module_curve") orelse return error.Missing_tsv_module_curve,
+        .sv_get_number_of_module_ctls = dll.lookup(tsv_get_number_of_module_ctls, "sv_get_number_of_module_ctls") orelse return error.Missing_tsv_get_number_of_module_ctls,
+        .sv_get_module_ctl_name = dll.lookup(tsv_get_module_ctl_name, "sv_get_module_ctl_name") orelse return error.Missing_tsv_get_module_ctl_name,
+        .sv_get_module_ctl_value = dll.lookup(tsv_get_module_ctl_value, "sv_get_module_ctl_value") orelse return error.Missing_tsv_get_module_ctl_value,
+        .sv_set_module_ctl_value = dll.lookup(tsv_set_module_ctl_value, "sv_set_module_ctl_value") orelse return error.Missing_tsv_set_module_ctl_value,
+        .sv_get_module_ctl_min = dll.lookup(tsv_get_module_ctl_min, "sv_get_module_ctl_min") orelse return error.Missing_tsv_get_module_ctl_min,
+        .sv_get_module_ctl_max = dll.lookup(tsv_get_module_ctl_max, "sv_get_module_ctl_max") orelse return error.Missing_tsv_get_module_ctl_max,
+        .sv_get_module_ctl_offset = dll.lookup(tsv_get_module_ctl_offset, "sv_get_module_ctl_offset") orelse return error.Missing_tsv_get_module_ctl_offset,
+        .sv_get_module_ctl_type = dll.lookup(tsv_get_module_ctl_type, "sv_get_module_ctl_type") orelse return error.Missing_tsv_get_module_ctl_type,
+        .sv_get_module_ctl_group = dll.lookup(tsv_get_module_ctl_group, "sv_get_module_ctl_group") orelse return error.Missing_tsv_get_module_ctl_group,
+        .sv_new_pattern = dll.lookup(tsv_new_pattern, "sv_new_pattern") orelse return error.Missing_tsv_new_pattern,
+        .sv_remove_pattern = dll.lookup(tsv_remove_pattern, "sv_remove_pattern") orelse return error.Missing_tsv_remove_pattern,
+        .sv_get_number_of_patterns = dll.lookup(tsv_get_number_of_patterns, "sv_get_number_of_patterns") orelse return error.Missing_tsv_get_number_of_patterns,
+        .sv_find_pattern = dll.lookup(tsv_find_pattern, "sv_find_pattern") orelse return error.Missing_tsv_find_pattern,
+        .sv_get_pattern_x = dll.lookup(tsv_get_pattern_x, "sv_get_pattern_x") orelse return error.Missing_tsv_get_pattern_x,
+        .sv_get_pattern_y = dll.lookup(tsv_get_pattern_y, "sv_get_pattern_y") orelse return error.Missing_tsv_get_pattern_y,
+        .sv_set_pattern_xy = dll.lookup(tsv_set_pattern_xy, "sv_set_pattern_xy") orelse return error.Missing_tsv_set_pattern_xy,
+        .sv_get_pattern_tracks = dll.lookup(tsv_get_pattern_tracks, "sv_get_pattern_tracks") orelse return error.Missing_tsv_get_pattern_tracks,
+        .sv_get_pattern_lines = dll.lookup(tsv_get_pattern_lines, "sv_get_pattern_lines") orelse return error.Missing_tsv_get_pattern_lines,
+        .sv_set_pattern_size = dll.lookup(tsv_set_pattern_size, "sv_set_pattern_size") orelse return error.Missing_tsv_set_pattern_size,
+        .sv_get_pattern_name = dll.lookup(tsv_get_pattern_name, "sv_get_pattern_name") orelse return error.Missing_tsv_get_pattern_name,
+        .sv_set_pattern_name = dll.lookup(tsv_set_pattern_name, "sv_set_pattern_name") orelse return error.Missing_tsv_set_pattern_name,
+        .sv_get_pattern_data = dll.lookup(tsv_get_pattern_data, "sv_get_pattern_data") orelse return error.Missing_tsv_get_pattern_data,
+        .sv_set_pattern_event = dll.lookup(tsv_set_pattern_event, "sv_set_pattern_event") orelse return error.Missing_tsv_set_pattern_event,
+        .sv_get_pattern_event = dll.lookup(tsv_get_pattern_event, "sv_get_pattern_event") orelse return error.Missing_tsv_get_pattern_event,
+        .sv_pattern_mute = dll.lookup(tsv_pattern_mute, "sv_pattern_mute") orelse return error.Missing_tsv_pattern_mute,
+        .sv_get_ticks = dll.lookup(tsv_get_ticks, "sv_get_ticks") orelse return error.Missing_tsv_get_ticks,
+        .sv_get_ticks_per_second = dll.lookup(tsv_get_ticks_per_second, "sv_get_ticks_per_second") orelse return error.Missing_tsv_get_ticks_per_second,
+        .sv_get_log = dll.lookup(tsv_get_log, "sv_get_log") orelse return error.Missing_tsv_get_log,
+    };
+
+    const result = sv.sv_init(if (config) |cfg| cfg.ptr else 0, @intCast(freq), @intCast(channels), @intCast(flags));
+
+    if (result > 0) {
+        return SunVoxVersion{ .raw = @intCast(result) };
+    } else {
+        return SvError.FailedToInitizeGlobalSoundSystem;
+    }
+}
+
+pub fn deinit() void {
+    // Build a collection for tracking the active sunvox instance for removal
+
+    dll.close();
+}
+
+// Here is the main instance:
+pub fn SunVox() type {
+    return struct {
+        const Self = @This();
+        _private: SunVoxPrivateField = undefined,
+
+        pub fn createInstance() SvError!Self {
+            for (0..instance_tracker.len) |i| {
+                if (!instance_tracker[i]) {
+                    instance_tracker[i] = true;
+                    if (sv.sv_open_slot(@intCast(i)) < 0) {
+                        return SvError.FailedToCraeteSunVoxInstance;
+                    }
+                    return Self{ ._private = .{ .instance_id = @intCast(i) } };
+                }
+            }
+            return SvError.MaximumInstancesExceeded;
+        }
     };
 }
 
-pub fn deinit() !void {
-    dll.close();
-    // Build a collection for tracking the active sunvox instance for removal
-
-}
-
 test "init sunvox library" {
-    try init();
+    const version = try init(null, 44100, 2, 0);
+    defer deinit();
+    try expectEqual(2, version.detail.major);
+    try expectEqual(1, version.detail.minor);
+    try expectEqual(2, version.detail.bug_fix);
 
-    const result = sv.sv_init(0, 44100, 2, 0);
-    std.debug.print("SunVox Version: {x}", .{result});
+    const instance = try SunVox().createInstance();
+    const instance_b = try SunVox().createInstance();
+    const instance_c = try SunVox().createInstance();
+
+    // validate the instance (slot) ID; however, the use of _private in your
+    // project is strongly discouraged because it will cause instance tracking
+    // to fail, causing improper behavior on destroying the instances.
+    try expectEqual(0, instance._private.instance_id);
+    try expectEqual(1, instance_b._private.instance_id);
+    try expectEqual(2, instance_c._private.instance_id);
+
+    var active_cnt: usize = 0;
+    for (instance_tracker) |state| {
+        active_cnt += if (state) 1 else 0;
+    }
+    try expectEqual(3, active_cnt);
 }
