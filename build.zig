@@ -40,8 +40,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // let's only consider 64bit windows first before moving onto other system
-    b.getInstallStep().dependOn(&b.addInstallFile(b.path("libs/sunvox/windows/lib_x86_64/sunvox.dll"), "lib/sunvox.dll").step);
-    b.getInstallStep().dependOn(&b.addInstallFile(b.path("libs/sunvox/windows/lib_x86_64/sunvox.dll"), "bin/sunvox.dll").step);
+    b.getInstallStep().dependOn(&b.addInstallBinFile(b.path("libs/sunvox/windows/lib_x86_64/sunvox.dll"), "sunvox.dll").step);
 
     const test_step = b.step("test", "zunvox tests");
 
@@ -66,4 +65,22 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&test_step_run.step);
 
     test_step_run.setCwd(b.path("zig-out/bin"));
+}
+
+pub fn installSunVoxBinary(
+    step: *std.Build.Step,
+    sunvox_dll: *std.Build.Dependency,
+    install_dir: std.Build.InstallDir,
+) void {
+    const b = step.owner;
+    step.dependOn(
+        &b.addInstallFileWithDir(
+            .{ .dependency = .{
+                .dependency = sunvox_dll,
+                .sub_path = "libs/sunvox/windows/lib_x86_64/sunvox.dll",
+            } },
+            install_dir,
+            "sunvox.dll",
+        ).step,
+    );
 }
