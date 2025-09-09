@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const assert = std.debug.assert;
 
 const expectEqual = std.testing.expectEqual;
 
@@ -209,15 +210,34 @@ const SunVoxFunctionTable = struct {
 // so that to provide a clearer ideas of what goes wrong with your projects
 const SvError = error{
     FailedToInitizeGlobalSoundSystem,
-    FailedToCraeteSunVoxInstance,
-    MaximumInstancesExceeded,
+    FailedToCraeteSunVoxSlot,
+    MaximumSlotExceeded,
+    FailedToDestroySlot,
+    SlotAlreadyDestroyed,
+    FailedToObtainSampleRate,
+    FailedToLockSlot,
+    FailedToUnlockSlot,
+    SlotAlreadyLocked,
+    SlotAlreadyUnlocked,
+    FailedToLoadProject,
+    FailedToSaveProject,
+    FailedToPlay,
+    FailedToStop,
+    FailedToCheckAutostopStatus,
+    FailedToSetAutoStop,
+    FailedToSetPlayheadPosition,
+    OutOfRange,
+    FailedToSetMasterVolume,
+    FailedToSetProjectName,
+    FailedToGetTempoInfo,
 };
 
 /// The original library requires the user to specify the sunvox instance ID (aka slot_id)
 /// created by the sv_init() function, but to prevent users accidentally modify the id,
 /// this type is created.
-const SunVoxPrivateField = struct {
-    instance_id: u4, // The original library capped the number of slots at 16
+const SlotPrivateField = struct {
+    instance_id: c_int, // The original library capped the number of slots at 16
+    has_locked: bool = false,
 };
 
 const SunVoxVersion = packed union {
@@ -251,7 +271,7 @@ pub const Note = extern struct {
 
 /// This combines the original sv_load_dll() and sv_init() function because
 /// these two functions are mandatory for putting the dynamic library in action
-pub fn init(config: ?[]u8, freq: u16, channels: u16, flags: u32) !SunVoxVersion {
+pub fn init(config: ?[]u8, freq: u32, channels: u32, flags: u32) !SunVoxVersion {
     dll = try std.DynLib.open("sunvox");
     sv = SunVoxFunctionTable{
         .sv_audio_callback = dll.lookup(tsv_audio_callback, "sv_audio_callback") orelse return error.Missing_tsv_audio_callback,
@@ -361,53 +381,264 @@ pub fn init(config: ?[]u8, freq: u16, channels: u16, flags: u32) !SunVoxVersion 
 }
 
 pub fn deinit() void {
-    // Build a collection for tracking the active sunvox instance for removal
+    var is_active_instance_remains = false;
+    for (instance_tracker) |state| {
+        if (state) {
+            std.log.err("Active SunVox Instances Found, Please Destroy All the Instance before deinit", .{});
+            is_active_instance_remains = true;
+            break;
+        }
+    }
+    assert(!is_active_instance_remains);
 
     dll.close();
 }
 
+pub fn getSampleRate() !u32 {
+    const result = sv.sv_get_sample_rate();
+    if (result > 0) {
+        return @intCast(result);
+    } else {
+        return SvError.FailedToObtainSampleRate;
+    }
+}
+
+// The behavior of these functions is not known yet, so
+// I am not going to write a wrapper function for now
+// TODO: sv_update_input()
+// TODO: sv_audio_callback()
+// TODO: sv_audio_callback2()
+
 // Here is the main instance:
-pub fn SunVox() type {
+pub fn Slot() type {
     return struct {
         const Self = @This();
-        _private: SunVoxPrivateField = undefined,
+        _private: SlotPrivateField = undefined,
+        Project: ProjectFn = undefined,
 
-        pub fn createInstance() SvError!Self {
+        // instance construction and destruction
+        pub fn create() SvError!Self {
             for (0..instance_tracker.len) |i| {
                 if (!instance_tracker[i]) {
-                    instance_tracker[i] = true;
                     if (sv.sv_open_slot(@intCast(i)) < 0) {
-                        return SvError.FailedToCraeteSunVoxInstance;
+                        return SvError.FailedToCraeteSunVoxSlot;
                     }
-                    return Self{ ._private = .{ .instance_id = @intCast(i) } };
+                    instance_tracker[i] = true;
+                    var slot = Self{
+                        ._private = .{ .instance_id = @intCast(i) },
+                    };
+                    slot.setupSlot();
+
+                    return slot;
                 }
             }
-            return SvError.MaximumInstancesExceeded;
+            return SvError.MaximumSlotExceeded;
+        }
+
+        fn setupSlot(self: *Self) void {
+            self.Project = ProjectFn{ ._private = self._private };
+        }
+
+        pub fn destroy(self: Self) SvError!void {
+            if (instance_tracker[@intCast(self._private.instance_id)]) {
+                if (sv.sv_close_slot(self._private.instance_id) == 0) {
+                    instance_tracker[@intCast(self._private.instance_id)] = false;
+                } else {
+                    return SvError.FailedToDestroySlot;
+                }
+            } else {
+                return SvError.SlotAlreadyDestroyed;
+            }
+        }
+
+        // lock/Unlock operations
+        pub fn lock(self: *Self) SvError!void {
+            if (self._private.has_locked) {
+                return SvError.SlotAlreadyLocked;
+            } else if (sv.sv_lock_slot(self._private.instance_id) == 0) {
+                self._private.has_locked = true;
+            } else {
+                return SvError.FailedToLockSlot;
+            }
+        }
+
+        pub fn unlock(self: *Self) SvError!void {
+            if (!self._private.has_locked) {
+                return SvError.SlotAlreadyUnlocked;
+            } else if (sv.sv_unlock_slot(self._private.instance_id) == 0) {
+                self._private.has_locked = false;
+            } else {
+                return SvError.FailedToUnlockSlot;
+            }
         }
     };
 }
 
-test "init sunvox library" {
+// Operations related to projects:
+const ProjectFn = struct {
+    _private: SlotPrivateField = undefined,
+
+    pub fn load(self: ProjectFn, file_path: []const u8) SvError!void {
+        const result = sv.sv_load(self._private.instance_id, @ptrCast(file_path.ptr));
+        if (result < 0) return SvError.FailedToLoadProject;
+    }
+
+    pub fn loadFromMemory(self: ProjectFn, data: []const u8) SvError!void {
+        const result = sv.sv_load(self._private.instance_id, @ptrCast(data.ptr));
+        if (result < 0) return SvError.FailedToLoadProject;
+    }
+
+    pub fn save(self: ProjectFn, file_name: []const u8) SvError!void {
+        const result = sv.sv_save(self._private.instance_id, @ptrCast(file_name.ptr));
+        if (result < 0) return SvError.FailedToSaveProject;
+    }
+
+    // TODO: Need to figure out how to destroy a chunk of memory create in shared library for save_memory()
+
+    pub fn play(self: ProjectFn) SvError!void {
+        const result = sv.sv_play(self._private.instance_id);
+        if (result < 0) return SvError.FailedToPlay;
+    }
+
+    pub fn playFromBeginning(self: ProjectFn) SvError!void {
+        const result = sv.sv_play_from_beginning(self._private.instance_id);
+        if (result < 0) return SvError.FailedToPlay;
+    }
+
+    pub fn stop(self: ProjectFn, hardstop: bool) SvError!void {
+        var result = sv.sv_stop(self._private.instance_id);
+        if (hardstop) {
+            result += sv.sv_stop(self._private.instance_id);
+        }
+        if (result < 0) {
+            return SvError.FailedToStop;
+        }
+    }
+
+    // TODO: sv_pause()
+    // TODO: sv_resume()
+    // TODO: sv_sync_resume()
+
+    pub fn isAutostopEnabled(self: ProjectFn) SvError!bool {
+        const result = sv.sv_get_autostop(self._private.instance_id);
+        if (result < 0) return SvError.FailedToCheckAutostopStatus;
+        return if (result == 0) false else true;
+    }
+
+    pub fn setAutoStop(self: ProjectFn, isAutoStop: bool) SvError!void {
+        const result = sv.sv_set_autostop(self._private.instance_id, if (isAutoStop) 1 else 0);
+        if (result < 0) return SvError.FailedToSetAutoStop;
+    }
+
+    pub fn isStopped(self: ProjectFn) bool {
+        const result = sv.sv_end_of_song(self._private.instance_id);
+        return if (result == 0) false else true;
+    }
+
+    pub fn getPlayheadPosition(self: ProjectFn) i32 {
+        return sv.sv_get_current_line(self._private.instance_id);
+    }
+
+    // TODO: we need a better presentation for sv_get_current_line2 before wrapping it as a function
+
+    pub fn setPlayheadPosition(self: ProjectFn, playhead_index: i32) SvError!void {
+        const result = sv.sv_rewind(self._private.instance_id, @intCast(playhead_index));
+        if (result < 0) return SvError.FailedToSetPlayheadPosition;
+    }
+
+    pub fn setMasterVolume(self: ProjectFn, volume: u32) SvError!void {
+        if (volume > 256) return SvError.OutOfRange;
+        const result = sv.sv_volume(self._private.instance_id, @intCast(volume));
+        if (result < 0) return SvError.FailedToSetMasterVolume;
+    }
+
+    pub fn getCurrentOutputSignalLevel(self: ProjectFn, channel: u32) u8 {
+        return @intCast(sv.sv_get_current_signal_level(self._private.instance_id, @intCast(channel)));
+    }
+
+    pub fn getName(self: ProjectFn) ?[]const u8 {
+        const result = sv.sv_get_song_name(self._private.instance_id);
+        if (result == null) return null;
+        return @ptrCast(result);
+    }
+
+    pub fn setName(self: ProjectFn, name: []const u8) SvError!void {
+        const result = sv.sv_set_song_name(self._private.instance_id, @ptrCast(name.ptr));
+        if (result < 0) return SvError.FailedToSetProjectName;
+    }
+
+    pub fn getBPM(self: ProjectFn) SvError!u32 {
+        return @intCast(sv.sv_get_song_bpm(self._private.instance_id));
+    }
+
+    pub fn getTPL(self: ProjectFn) SvError!u32 {
+        return @intCast(sv.sv_get_song_tpl(self._private.instance_id));
+    }
+
+    pub fn getLengthBySamepleFrameCount(self: ProjectFn) SvError!u32 {
+        return @intCast(sv.sv_get_song_length_frames(self._private.instance_id));
+    }
+
+    pub fn getLengthByLineCount(self: ProjectFn) SvError!u32 {
+        return @intCast(sv.sv_get_song_length_lines(self._private.instance_id));
+    }
+
+    // TODO Need to know how sv_get_time_map() behaved and what kind of return type for better accessiblilty
+};
+
+test "init sunvox library; create and destory SunVox Instances" {
     const version = try init(null, 44100, 2, 0);
     defer deinit();
     try expectEqual(2, version.detail.major);
     try expectEqual(1, version.detail.minor);
     try expectEqual(2, version.detail.bug_fix);
 
-    const instance = try SunVox().createInstance();
-    const instance_b = try SunVox().createInstance();
-    const instance_c = try SunVox().createInstance();
+    // Validate Systemwise functions
+    const sample_rate = try getSampleRate();
+    try expectEqual(44100, sample_rate);
+
+    // Create and Validate Slots
+    const slot_a = try Slot().create();
+    const slot_b = try Slot().create();
+    const slot_c = try Slot().create();
+
+    const err_msg = "SunVox Instance Creation Failed";
+    defer slot_a.destroy() catch @panic(err_msg);
+    defer slot_b.destroy() catch @panic(err_msg);
+    defer slot_c.destroy() catch @panic(err_msg);
 
     // validate the instance (slot) ID; however, the use of _private in your
     // project is strongly discouraged because it will cause instance tracking
     // to fail, causing improper behavior on destroying the instances.
-    try expectEqual(0, instance._private.instance_id);
-    try expectEqual(1, instance_b._private.instance_id);
-    try expectEqual(2, instance_c._private.instance_id);
+    try expectEqual(0, slot_a._private.instance_id);
+    try expectEqual(1, slot_b._private.instance_id);
+    try expectEqual(2, slot_c._private.instance_id);
 
     var active_cnt: usize = 0;
     for (instance_tracker) |state| {
         active_cnt += if (state) 1 else 0;
     }
     try expectEqual(3, active_cnt);
+}
+
+test "project level function" {
+    _ = try init(null, 44100, 2, 0);
+    defer deinit();
+
+    var slot = try Slot().create();
+    defer slot.destroy() catch {};
+
+    // These are the default sunvox project settings
+    try expectEqual(125, slot.Project.getBPM());
+    try expectEqual(6, slot.Project.getTPL());
+    try expectEqual(0, slot.Project.getCurrentOutputSignalLevel(0));
+    try expectEqual(32, slot.Project.getLengthByLineCount()); // default pattern on an empty project
+    try expectEqual(0, slot.Project.getPlayheadPosition());
+
+    try slot.Project.setPlayheadPosition(23);
+    // SunVox Lib has latency for setting some of the functions and it is run in a differnt thread,
+    // so make sure you have applied some delays or use their corresponding get functions to ensure
+    // the control is properly set.
+    std.Thread.sleep(1e9);
+    try expectEqual(23, slot.Project.getPlayheadPosition());
 }
