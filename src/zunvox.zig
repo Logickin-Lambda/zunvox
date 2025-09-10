@@ -230,14 +230,41 @@ const SvError = error{
     FailedToSetMasterVolume,
     FailedToSetProjectName,
     FailedToGetTempoInfo,
+    FailedToChangeEventSendLatency,
+    FailedToSetEvent,
 };
 
 /// The original library requires the user to specify the sunvox instance ID (aka slot_id)
 /// created by the sv_init() function, but to prevent users accidentally modify the id,
 /// this type is created.
 const SlotPrivateField = struct {
-    instance_id: c_int, // The original library capped the number of slots at 16
-    has_locked: bool = false,
+    slot_id: c_int, // The original library capped the number of slots at 16
+    is_locked: bool = false,
+};
+
+/// to prevent user modifying the private field which will corrupt the slot_state_list
+/// which is used for tracking any available slots for the library, this opaque type
+/// will hide the field for the SlotPrivateField stored in the
+const SlotInfo = opaque {
+    fn getSlotId(self: *SlotInfo) c_int {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        return private_field.slot_id;
+    }
+
+    fn isLocked(self: *SlotInfo) bool {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        return private_field.is_locked;
+    }
+
+    fn lock(self: *SlotInfo) void {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        private_field.is_locked = true;
+    }
+
+    fn unlock(self: *SlotInfo) void {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        private_field.is_locked = false;
+    }
 };
 
 const SunVoxVersion = packed union {
@@ -251,7 +278,7 @@ const SunVoxVersion = packed union {
 
 var sv: SunVoxFunctionTable = undefined;
 var dll: std.DynLib = undefined;
-var instance_tracker = std.mem.zeroes([16]bool);
+var slot_state_list = std.mem.zeroes([16]bool);
 
 // ______________________________________________________________________________________________________________________
 //                                                                                                                      /
@@ -382,7 +409,7 @@ pub fn init(config: ?[]u8, freq: u32, channels: u32, flags: u32) !SunVoxVersion 
 
 pub fn deinit() void {
     var is_active_instance_remains = false;
-    for (instance_tracker) |state| {
+    for (slot_state_list) |state| {
         if (state) {
             std.log.err("Active SunVox Instances Found, Please Destroy All the Instance before deinit", .{});
             is_active_instance_remains = true;
@@ -413,21 +440,25 @@ pub fn getSampleRate() !u32 {
 pub fn Slot() type {
     return struct {
         const Self = @This();
-        _private: SlotPrivateField = undefined,
-        Project: ProjectFn = undefined,
+        _info: *SlotInfo = undefined,
+        _allocator: std.mem.Allocator = undefined,
+        Project: ProjectFn = ProjectFn{},
+        Event: EventFn = EventFn{},
 
         // instance construction and destruction
-        pub fn create() SvError!Self {
-            for (0..instance_tracker.len) |i| {
-                if (!instance_tracker[i]) {
+        pub fn create(allocator: std.mem.Allocator) anyerror!Self {
+            for (0..slot_state_list.len) |i| {
+                if (!slot_state_list[i]) {
                     if (sv.sv_open_slot(@intCast(i)) < 0) {
                         return SvError.FailedToCraeteSunVoxSlot;
                     }
-                    instance_tracker[i] = true;
-                    var slot = Self{
-                        ._private = .{ .instance_id = @intCast(i) },
-                    };
-                    slot.setupSlot();
+                    slot_state_list[i] = true;
+
+                    var private_field = try allocator.create(SlotPrivateField);
+                    private_field.slot_id = @intCast(i);
+
+                    var slot = Self{};
+                    slot.setupSlot(allocator, @ptrCast(private_field));
 
                     return slot;
                 }
@@ -435,17 +466,23 @@ pub fn Slot() type {
             return SvError.MaximumSlotExceeded;
         }
 
-        fn setupSlot(self: *Self) void {
-            self.Project = ProjectFn{ ._private = self._private };
+        fn setupSlot(self: *Self, allocator: std.mem.Allocator, slot_info: *SlotInfo) void {
+            self._allocator = allocator;
+            self._info = slot_info;
+            self.Project._info = slot_info;
+            self.Event._info = slot_info;
         }
 
         pub fn destroy(self: Self) SvError!void {
-            if (instance_tracker[@intCast(self._private.instance_id)]) {
-                if (sv.sv_close_slot(self._private.instance_id) == 0) {
-                    instance_tracker[@intCast(self._private.instance_id)] = false;
-                } else {
+            const slot_id = self._info.getSlotId();
+            if (slot_state_list[@intCast(slot_id)]) {
+                if (sv.sv_close_slot(slot_id) != 0) {
                     return SvError.FailedToDestroySlot;
                 }
+
+                // Clear off the private object, and release the instance_tracker state to inactive
+                self._allocator.destroy(@as(*SlotPrivateField, @ptrCast(@alignCast(self._info))));
+                slot_state_list[@intCast(slot_id)] = false;
             } else {
                 return SvError.SlotAlreadyDestroyed;
             }
@@ -453,20 +490,20 @@ pub fn Slot() type {
 
         // lock/Unlock operations
         pub fn lock(self: *Self) SvError!void {
-            if (self._private.has_locked) {
+            if (self._info.isLocked()) {
                 return SvError.SlotAlreadyLocked;
-            } else if (sv.sv_lock_slot(self._private.instance_id) == 0) {
-                self._private.has_locked = true;
+            } else if (sv.sv_lock_slot(self._info.getSlotId()) == 0) {
+                self._info.lock();
             } else {
                 return SvError.FailedToLockSlot;
             }
         }
 
         pub fn unlock(self: *Self) SvError!void {
-            if (!self._private.has_locked) {
+            if (!self._info.isLocked()) {
                 return SvError.SlotAlreadyUnlocked;
-            } else if (sv.sv_unlock_slot(self._private.instance_id) == 0) {
-                self._private.has_locked = false;
+            } else if (sv.sv_unlock_slot(self._info.getSlotId()) == 0) {
+                self._info.unlock();
             } else {
                 return SvError.FailedToUnlockSlot;
             }
@@ -476,39 +513,39 @@ pub fn Slot() type {
 
 // Operations related to projects:
 const ProjectFn = struct {
-    _private: SlotPrivateField = undefined,
+    _info: *SlotInfo = undefined,
 
     pub fn load(self: ProjectFn, file_path: []const u8) SvError!void {
-        const result = sv.sv_load(self._private.instance_id, @ptrCast(file_path.ptr));
+        const result = sv.sv_load(self._info.getSlotId(), @ptrCast(file_path.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
     }
 
     pub fn loadFromMemory(self: ProjectFn, data: []const u8) SvError!void {
-        const result = sv.sv_load(self._private.instance_id, @ptrCast(data.ptr));
+        const result = sv.sv_load(self._info.getSlotId(), @ptrCast(data.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
     }
 
     pub fn save(self: ProjectFn, file_name: []const u8) SvError!void {
-        const result = sv.sv_save(self._private.instance_id, @ptrCast(file_name.ptr));
+        const result = sv.sv_save(self._info.getSlotId(), @ptrCast(file_name.ptr));
         if (result < 0) return SvError.FailedToSaveProject;
     }
 
     // TODO: Need to figure out how to destroy a chunk of memory create in shared library for save_memory()
 
     pub fn play(self: ProjectFn) SvError!void {
-        const result = sv.sv_play(self._private.instance_id);
+        const result = sv.sv_play(self._info.getSlotId());
         if (result < 0) return SvError.FailedToPlay;
     }
 
     pub fn playFromBeginning(self: ProjectFn) SvError!void {
-        const result = sv.sv_play_from_beginning(self._private.instance_id);
+        const result = sv.sv_play_from_beginning(self._info.getSlotId());
         if (result < 0) return SvError.FailedToPlay;
     }
 
     pub fn stop(self: ProjectFn, hardstop: bool) SvError!void {
-        var result = sv.sv_stop(self._private.instance_id);
+        var result = sv.sv_stop(self._info.getSlotId());
         if (hardstop) {
-            result += sv.sv_stop(self._private.instance_id);
+            result += sv.sv_stop(self._info.getSlotId());
         }
         if (result < 0) {
             return SvError.FailedToStop;
@@ -520,70 +557,113 @@ const ProjectFn = struct {
     // TODO: sv_sync_resume()
 
     pub fn isAutostopEnabled(self: ProjectFn) SvError!bool {
-        const result = sv.sv_get_autostop(self._private.instance_id);
+        const result = sv.sv_get_autostop(self._info.getSlotId());
         if (result < 0) return SvError.FailedToCheckAutostopStatus;
         return if (result == 0) false else true;
     }
 
     pub fn setAutoStop(self: ProjectFn, isAutoStop: bool) SvError!void {
-        const result = sv.sv_set_autostop(self._private.instance_id, if (isAutoStop) 1 else 0);
+        const result = sv.sv_set_autostop(self._info.getSlotId(), if (isAutoStop) 1 else 0);
         if (result < 0) return SvError.FailedToSetAutoStop;
     }
 
     pub fn isStopped(self: ProjectFn) bool {
-        const result = sv.sv_end_of_song(self._private.instance_id);
+        const result = sv.sv_end_of_song(self._info.getSlotId());
         return if (result == 0) false else true;
     }
 
     pub fn getPlayheadPosition(self: ProjectFn) i32 {
-        return sv.sv_get_current_line(self._private.instance_id);
+        return sv.sv_get_current_line(self._info.getSlotId());
     }
 
     // TODO: we need a better presentation for sv_get_current_line2 before wrapping it as a function
 
     pub fn setPlayheadPosition(self: ProjectFn, playhead_index: i32) SvError!void {
-        const result = sv.sv_rewind(self._private.instance_id, @intCast(playhead_index));
+        const result = sv.sv_rewind(self._info.getSlotId(), @intCast(playhead_index));
         if (result < 0) return SvError.FailedToSetPlayheadPosition;
     }
 
     pub fn setMasterVolume(self: ProjectFn, volume: u32) SvError!void {
         if (volume > 256) return SvError.OutOfRange;
-        const result = sv.sv_volume(self._private.instance_id, @intCast(volume));
+        const result = sv.sv_volume(self._info.getSlotId(), @intCast(volume));
         if (result < 0) return SvError.FailedToSetMasterVolume;
     }
 
     pub fn getCurrentOutputSignalLevel(self: ProjectFn, channel: u32) u8 {
-        return @intCast(sv.sv_get_current_signal_level(self._private.instance_id, @intCast(channel)));
+        return @intCast(sv.sv_get_current_signal_level(self._info.getSlotId(), @intCast(channel)));
     }
 
     pub fn getName(self: ProjectFn) ?[]const u8 {
-        const result = sv.sv_get_song_name(self._private.instance_id);
+        const result = sv.sv_get_song_name(self._info.getSlotId());
         if (result == null) return null;
         return @ptrCast(result);
     }
 
     pub fn setName(self: ProjectFn, name: []const u8) SvError!void {
-        const result = sv.sv_set_song_name(self._private.instance_id, @ptrCast(name.ptr));
+        const result = sv.sv_set_song_name(self._info.getSlotId(), @ptrCast(name.ptr));
         if (result < 0) return SvError.FailedToSetProjectName;
     }
 
     pub fn getBPM(self: ProjectFn) SvError!u32 {
-        return @intCast(sv.sv_get_song_bpm(self._private.instance_id));
+        return @intCast(sv.sv_get_song_bpm(self._info.getSlotId()));
     }
 
     pub fn getTPL(self: ProjectFn) SvError!u32 {
-        return @intCast(sv.sv_get_song_tpl(self._private.instance_id));
+        return @intCast(sv.sv_get_song_tpl(self._info.getSlotId()));
     }
 
     pub fn getLengthBySamepleFrameCount(self: ProjectFn) SvError!u32 {
-        return @intCast(sv.sv_get_song_length_frames(self._private.instance_id));
+        return @intCast(sv.sv_get_song_length_frames(self._info.getSlotId()));
     }
 
     pub fn getLengthByLineCount(self: ProjectFn) SvError!u32 {
-        return @intCast(sv.sv_get_song_length_lines(self._private.instance_id));
+        return @intCast(sv.sv_get_song_length_lines(self._info.getSlotId()));
     }
 
     // TODO Need to know how sv_get_time_map() behaved and what kind of return type for better accessiblilty
+};
+
+const EventFn = struct {
+    _info: *SlotInfo = undefined,
+
+    pub fn minimizeEventSendLatency(self: EventFn) SvError!void {
+        const result = sv.sv_set_event_t(self._info.getSlotId(), 1, 0);
+        if (result < 0) return SvError.FailedToChangeEventSendLatency;
+    }
+
+    pub fn autoEventSendLatency(self: EventFn) SvError!void {
+        const result = sv.sv_set_event_t(self._info.getSlotId(), 0, 0);
+        if (result < 0) return SvError.FailedToChangeEventSendLatency;
+    }
+
+    pub fn setEventSendLatency(self: EventFn, system_tick: i32) SvError!void {
+        const result = sv.sv_set_event_t(self._info.getSlotId(), 0, @intCast(system_tick));
+        if (result < 0) return SvError.FailedToChangeEventSendLatency;
+    }
+
+    pub fn sendEventFull(
+        self: EventFn,
+        event: struct {
+            track: u8 = 0, // SunVox pattern only support 32 tracks, so u8 is sufficient
+            note: u8 = 0,
+            vel: u8 = 0,
+            module: u16 = 0,
+            ctl: packed union { raw: u16, div: struct { ee: u8, cc: u8 } } = .{ .raw = 0 },
+            ctl_val: u16,
+        },
+    ) SvError!void {
+        const result = sv.sv_send_event(
+            self._info.getSlotId(),
+            @intCast(event.track),
+            @intCast(event.note),
+            @intCast(event.vel),
+            @intCast(event.module),
+            @intCast(event.ctl.raw),
+            @intCast(event.ctl_val),
+        );
+
+        if (result < 0) return SvError.FailedToSetEvent;
+    }
 };
 
 test "init sunvox library; create and destory SunVox Instances" {
@@ -598,11 +678,13 @@ test "init sunvox library; create and destory SunVox Instances" {
     try expectEqual(44100, sample_rate);
 
     // Create and Validate Slots
-    const slot_a = try Slot().create();
-    const slot_b = try Slot().create();
-    const slot_c = try Slot().create();
+    const allocator = std.testing.allocator;
 
-    const err_msg = "SunVox Instance Creation Failed";
+    const slot_a = try Slot().create(allocator);
+    const slot_b = try Slot().create(allocator);
+    const slot_c = try Slot().create(allocator);
+
+    const err_msg = "Failed to destroy SunVox Slot";
     defer slot_a.destroy() catch @panic(err_msg);
     defer slot_b.destroy() catch @panic(err_msg);
     defer slot_c.destroy() catch @panic(err_msg);
@@ -610,12 +692,18 @@ test "init sunvox library; create and destory SunVox Instances" {
     // validate the instance (slot) ID; however, the use of _private in your
     // project is strongly discouraged because it will cause instance tracking
     // to fail, causing improper behavior on destroying the instances.
-    try expectEqual(0, slot_a._private.instance_id);
-    try expectEqual(1, slot_b._private.instance_id);
-    try expectEqual(2, slot_c._private.instance_id);
+    try expectEqual(0, slot_a._info.getSlotId());
+    try expectEqual(1, slot_b._info.getSlotId());
+    try expectEqual(2, slot_c._info.getSlotId());
+
+    // the  SubModules should also have the same id; however, accessing these fuctions
+    // by user shall be forbidden
+    try expectEqual(slot_a._info.getSlotId(), slot_a.Project._info.getSlotId());
+    try expectEqual(slot_b._info.getSlotId(), slot_b.Project._info.getSlotId());
+    try expectEqual(slot_c._info.getSlotId(), slot_c.Project._info.getSlotId());
 
     var active_cnt: usize = 0;
-    for (instance_tracker) |state| {
+    for (slot_state_list) |state| {
         active_cnt += if (state) 1 else 0;
     }
     try expectEqual(3, active_cnt);
@@ -625,7 +713,8 @@ test "project level function" {
     _ = try init(null, 44100, 2, 0);
     defer deinit();
 
-    var slot = try Slot().create();
+    const allocator = std.testing.allocator;
+    var slot = try Slot().create(allocator);
     defer slot.destroy() catch {};
 
     // These are the default sunvox project settings
@@ -642,3 +731,29 @@ test "project level function" {
     std.Thread.sleep(1e9);
     try expectEqual(23, slot.Project.getPlayheadPosition());
 }
+
+// I actually want to turn this forum post into an actual feature
+//
+// Noties are instrument characters that assist you in placing and deleting them.
+// White: Synth Notey
+// Blue: Piano Notey
+// Green: 2nd Synth Notey
+// Turquoise: Xylo Notey (what)
+// Red: Choir Notey
+// Pink: Pad Notey
+// Yellow: Bass Notey
+// Orange: 2nd Bass Notey
+// Cyan: Sound Notey (???)
+// Green Yellow: Bass Kick Notey
+// Green Blue: Bass Drum Notey (yep)
+// Pink Red: Clap Notey
+// Blue Turquoise: Cymbal Notey
+// Green White: Hi-Hat Notey
+// Green Red: Tiss Notey
+// Pink Red: Snare Notey
+// Noties are the most features in PixiTracker. Use them.
+//
+// Looks like this can be some kind of magical, generative synth patches.
+// It would be cool if I can generate a patch by:
+//
+// const module: u32 = sunvox_slot.Notey(.yep).PLEASE_ANSWER_PLEASE();
