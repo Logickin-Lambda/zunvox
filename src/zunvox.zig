@@ -206,6 +206,82 @@ const SunVoxFunctionTable = struct {
     sv_get_log: tsv_get_log = undefined,
 };
 
+// Module Lkup for creating the modules since sunvox passes strings instead of enums or index for module typing
+fn getModuleName(module_type: ModuleType) []const u8 {
+    return switch (module_type) {
+        .Analog_generator => "Analog generator",
+        .DrumSynth => "DrumSynth",
+        .FM => "FM",
+        .FMX => "FMX",
+        .Generator => "Generator",
+        .Input => "Input",
+        .Kicker => "Kicker",
+        .Vorbis_player => "Vorbis player",
+        .Sampler => "Sampler",
+        .SpectraVoice => "SpectraVoice",
+        .Amplifier => "Amplifier",
+        .Compressor => "Compressor",
+        .DC_Blocker => "DC_Blocker",
+        .Delay => "Delay",
+        .Distortion => "Distortion",
+        .Echo => "Echo",
+        .EQ => "EQ",
+        .FFT => "FFT",
+        .Filter => "Filter",
+        .Filter_Pro => "Filter Pro",
+        .Flanger => "Flanger",
+        .LFO => "LFO",
+        .Loop => "Loop",
+        .Modulator => "Modulator",
+        .Pitch_shifter => "Pitch_shifter",
+        .Reverb => "Reverb",
+        .Smooth => "Smooth",
+        .Vocal_filter => "Vocal filter",
+        .Vibrato => "Vibrato",
+        .Waveshaper => "Waveshaper",
+        .ADSR => "ADSR",
+        .Ctl2Note => "Ctl2Note",
+        .Feedback => "Feedback",
+        .Glide => "Glide",
+        .GPIO => "GPIO",
+        .MetaModule => "MetaModule",
+        .MultiCtl => "MultiCtl",
+        .MultiSynth => "MultiSynth",
+        .Pitch2Ctl => "Pitch2Ctl",
+        .Pitch_Detector => "Pitch_Detector",
+        .Sound2Ctl => "Sound2Ctl",
+        .Velocity2Ctl => "Velocity2Ctl",
+    };
+}
+
+const SamplerProperties = enum(c_int) {
+    LoopBeginPosition = 0,
+    LoopDuration,
+    LoopType,
+    LoopReleaseFlag,
+    Volume,
+    Panning,
+    Finetune,
+    RelativeNote,
+    StartPosition,
+};
+
+const SamplerLoopType = enum(c_int) {
+    Forward = 0,
+    PingPong,
+};
+
+const LoopReleaseFlag = enum(c_int) {
+    None = 0,
+    LoopFinishAfterRelease,
+};
+
+const SamplerParamValues = packed union {
+    int: c_int,
+    loop_type: SamplerLoopType,
+    loop_release_flag: LoopReleaseFlag,
+};
+
 // Here are the list of errors for the library, to replace the negative value used for the original library
 // so that to provide a clearer ideas of what goes wrong with your projects
 const SvError = error{
@@ -232,6 +308,15 @@ const SvError = error{
     FailedToGetTempoInfo,
     FailedToChangeEventSendLatency,
     FailedToSetEvent,
+    FailedToCreateModule,
+    FailedToRemoveModule,
+    FailedToConnectModule,
+    FailedToDisconnectedModule,
+    LockRequired,
+    NotSampler,
+    NotMetaModule,
+    FailedToLoadSample,
+    SampleParameterNotFound,
 };
 
 /// The original library requires the user to specify the sunvox instance ID (aka slot_id)
@@ -294,6 +379,60 @@ pub const Note = extern struct {
     module: u16,
     ctl: u16,
     ctl_vel: u16,
+};
+
+/// I understand the naming convention is a bit... not consistent,
+/// but since we have used SunVox for a long time or at least long
+/// enough before touching this library, we find some familiarity
+/// with this convention, but this could easily causes typing mistakes;
+/// thus, the ZunVox library will offer you an enum instead so that
+/// the library handles the typing for you when you add a new module.
+pub const ModuleType = enum(u8) {
+    // synths
+    Analog_generator = 0,
+    DrumSynth,
+    FM,
+    FMX,
+    Generator,
+    Input,
+    Kicker,
+    Vorbis_player,
+    Sampler,
+    SpectraVoice,
+    // effects
+    Amplifier,
+    Compressor,
+    DC_Blocker,
+    Delay,
+    Distortion,
+    Echo,
+    EQ,
+    FFT,
+    Filter,
+    Filter_Pro,
+    Flanger,
+    LFO,
+    Loop,
+    Modulator,
+    Pitch_shifter,
+    Reverb,
+    Smooth,
+    Vocal_filter,
+    Vibrato,
+    Waveshaper,
+    //misc
+    ADSR,
+    Ctl2Note,
+    Feedback,
+    Glide,
+    GPIO,
+    MetaModule,
+    MultiCtl,
+    MultiSynth,
+    Pitch2Ctl,
+    Pitch_Detector,
+    Sound2Ctl,
+    Velocity2Ctl,
 };
 
 /// This combines the original sv_load_dll() and sv_init() function because
@@ -437,112 +576,111 @@ pub fn getSampleRate() !u32 {
 // TODO: sv_audio_callback2()
 
 // Here is the main instance:
-pub fn Slot() type {
-    return struct {
-        const Self = @This();
-        _info: *SlotInfo = undefined,
-        _allocator: std.mem.Allocator = undefined,
-        Project: ProjectFn = ProjectFn{},
-        Event: EventFn = EventFn{},
+pub const Slot = struct {
+    const Self = @This();
+    _info: *SlotInfo = undefined,
+    _allocator: std.mem.Allocator = undefined,
+    Project: ProjectFn = ProjectFn{},
+    Event: EventFn = EventFn{},
 
-        // instance construction and destruction
-        pub fn create(allocator: std.mem.Allocator) anyerror!Self {
-            for (0..slot_state_list.len) |i| {
-                if (!slot_state_list[i]) {
-                    if (sv.sv_open_slot(@intCast(i)) < 0) {
-                        return SvError.FailedToCraeteSunVoxSlot;
-                    }
-                    slot_state_list[i] = true;
-
-                    var private_field = try allocator.create(SlotPrivateField);
-                    private_field.slot_id = @intCast(i);
-
-                    var slot = Self{};
-                    slot.setupSlot(allocator, @ptrCast(private_field));
-
-                    return slot;
+    // instance construction and destruction
+    pub fn create(allocator: std.mem.Allocator) anyerror!Self {
+        for (0..slot_state_list.len) |i| {
+            if (!slot_state_list[i]) {
+                if (sv.sv_open_slot(@intCast(i)) < 0) {
+                    return SvError.FailedToCraeteSunVoxSlot;
                 }
-            }
-            return SvError.MaximumSlotExceeded;
-        }
+                slot_state_list[i] = true;
 
-        fn setupSlot(self: *Self, allocator: std.mem.Allocator, slot_info: *SlotInfo) void {
-            self._allocator = allocator;
-            self._info = slot_info;
-            self.Project._info = slot_info;
-            self.Event._info = slot_info;
-        }
+                var private_field = try allocator.create(SlotPrivateField);
+                private_field.slot_id = @intCast(i);
 
-        pub fn destroy(self: Self) SvError!void {
-            const slot_id = self._info.getSlotId();
-            if (slot_state_list[@intCast(slot_id)]) {
-                if (sv.sv_close_slot(slot_id) != 0) {
-                    return SvError.FailedToDestroySlot;
-                }
+                var slot = Self{};
+                slot.setupSlot(allocator, @ptrCast(private_field));
 
-                // Clear off the private object, and release the instance_tracker state to inactive
-                self._allocator.destroy(@as(*SlotPrivateField, @ptrCast(@alignCast(self._info))));
-                slot_state_list[@intCast(slot_id)] = false;
-            } else {
-                return SvError.SlotAlreadyDestroyed;
+                return slot;
             }
         }
+        return SvError.MaximumSlotExceeded;
+    }
 
-        // lock/Unlock operations
-        pub fn lock(self: *Self) SvError!void {
-            if (self._info.isLocked()) {
-                return SvError.SlotAlreadyLocked;
-            } else if (sv.sv_lock_slot(self._info.getSlotId()) == 0) {
-                self._info.lock();
-            } else {
-                return SvError.FailedToLockSlot;
-            }
-        }
+    fn setupSlot(self: *Self, allocator: std.mem.Allocator, slot_info: *SlotInfo) void {
+        self._allocator = allocator;
+        self._info = slot_info;
+        self.Project._info = slot_info;
+        self.Event._info = slot_info;
+    }
 
-        pub fn unlock(self: *Self) SvError!void {
-            if (!self._info.isLocked()) {
-                return SvError.SlotAlreadyUnlocked;
-            } else if (sv.sv_unlock_slot(self._info.getSlotId()) == 0) {
-                self._info.unlock();
-            } else {
-                return SvError.FailedToUnlockSlot;
+    pub fn destroy(self: Self) SvError!void {
+        const slot_id = self._info.getSlotId();
+        if (slot_state_list[@intCast(slot_id)]) {
+            if (sv.sv_close_slot(slot_id) != 0) {
+                return SvError.FailedToDestroySlot;
             }
+
+            // Clear off the private object, and release the instance_tracker state to inactive
+            self._allocator.destroy(@as(*SlotPrivateField, @ptrCast(@alignCast(self._info))));
+            slot_state_list[@intCast(slot_id)] = false;
+        } else {
+            return SvError.SlotAlreadyDestroyed;
         }
-    };
-}
+    }
+
+    // lock/Unlock operations
+    pub fn lock(self: *Self) SvError!void {
+        if (self._info.isLocked()) {
+            return SvError.SlotAlreadyLocked;
+        } else if (sv.sv_lock_slot(self._info.getSlotId()) == 0) {
+            self._info.lock();
+        } else {
+            return SvError.FailedToLockSlot;
+        }
+    }
+
+    pub fn unlock(self: *Self) SvError!void {
+        if (!self._info.isLocked()) {
+            return SvError.SlotAlreadyUnlocked;
+        } else if (sv.sv_unlock_slot(self._info.getSlotId()) == 0) {
+            self._info.unlock();
+        } else {
+            return SvError.FailedToUnlockSlot;
+        }
+    }
+};
 
 // Operations related to projects:
 const ProjectFn = struct {
+    const Self = @This();
     _info: *SlotInfo = undefined,
 
-    pub fn load(self: ProjectFn, file_path: []const u8) SvError!void {
-        const result = sv.sv_load(self._info.getSlotId(), @ptrCast(file_path.ptr));
+    pub fn load(self: Self, file_path: []const u8) SvError!void {
+        const result = sv.sv_load(self._info.getSlotId(), @constCast(file_path.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
     }
 
-    pub fn loadFromMemory(self: ProjectFn, data: []const u8) SvError!void {
-        const result = sv.sv_load(self._info.getSlotId(), @ptrCast(data.ptr));
+    pub fn loadFromMemory(self: Self, data: []const u8) SvError!void {
+        const result = sv.sv_load(self._info.getSlotId(), @constCast(data.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
     }
 
-    pub fn save(self: ProjectFn, file_name: []const u8) SvError!void {
-        const result = sv.sv_save(self._info.getSlotId(), @ptrCast(file_name.ptr));
+    pub fn save(self: Self, file_name: []const u8) SvError!void {
+        const result = sv.sv_save(self._info.getSlotId(), @constCast(file_name.ptr));
         if (result < 0) return SvError.FailedToSaveProject;
     }
 
     // TODO: Need to figure out how to destroy a chunk of memory create in shared library for save_memory()
 
-    pub fn play(self: ProjectFn) SvError!void {
+    pub fn play(self: Self) SvError!void {
         const result = sv.sv_play(self._info.getSlotId());
         if (result < 0) return SvError.FailedToPlay;
     }
 
-    pub fn playFromBeginning(self: ProjectFn) SvError!void {
+    pub fn playFromBeginning(self: Self) SvError!void {
         const result = sv.sv_play_from_beginning(self._info.getSlotId());
         if (result < 0) return SvError.FailedToPlay;
     }
 
-    pub fn stop(self: ProjectFn, hardstop: bool) SvError!void {
+    pub fn stop(self: Self, hardstop: bool) SvError!void {
         var result = sv.sv_stop(self._info.getSlotId());
         if (hardstop) {
             result += sv.sv_stop(self._info.getSlotId());
@@ -556,67 +694,67 @@ const ProjectFn = struct {
     // TODO: sv_resume()
     // TODO: sv_sync_resume()
 
-    pub fn isAutostopEnabled(self: ProjectFn) SvError!bool {
+    pub fn isAutostopEnabled(self: Self) SvError!bool {
         const result = sv.sv_get_autostop(self._info.getSlotId());
         if (result < 0) return SvError.FailedToCheckAutostopStatus;
         return if (result == 0) false else true;
     }
 
-    pub fn setAutoStop(self: ProjectFn, isAutoStop: bool) SvError!void {
+    pub fn setAutoStop(self: Self, isAutoStop: bool) SvError!void {
         const result = sv.sv_set_autostop(self._info.getSlotId(), if (isAutoStop) 1 else 0);
         if (result < 0) return SvError.FailedToSetAutoStop;
     }
 
-    pub fn isStopped(self: ProjectFn) bool {
+    pub fn isStopped(self: Self) bool {
         const result = sv.sv_end_of_song(self._info.getSlotId());
         return if (result == 0) false else true;
     }
 
-    pub fn getPlayheadPosition(self: ProjectFn) i32 {
+    pub fn getPlayheadPosition(self: Self) i32 {
         return sv.sv_get_current_line(self._info.getSlotId());
     }
 
     // TODO: we need a better presentation for sv_get_current_line2 before wrapping it as a function
 
-    pub fn setPlayheadPosition(self: ProjectFn, playhead_index: i32) SvError!void {
+    pub fn setPlayheadPosition(self: Self, playhead_index: i32) SvError!void {
         const result = sv.sv_rewind(self._info.getSlotId(), @intCast(playhead_index));
         if (result < 0) return SvError.FailedToSetPlayheadPosition;
     }
 
-    pub fn setMasterVolume(self: ProjectFn, volume: u32) SvError!void {
+    pub fn setMasterVolume(self: Self, volume: u32) SvError!void {
         if (volume > 256) return SvError.OutOfRange;
         const result = sv.sv_volume(self._info.getSlotId(), @intCast(volume));
         if (result < 0) return SvError.FailedToSetMasterVolume;
     }
 
-    pub fn getCurrentOutputSignalLevel(self: ProjectFn, channel: u32) u8 {
+    pub fn getCurrentOutputSignalLevel(self: Self, channel: u32) u8 {
         return @intCast(sv.sv_get_current_signal_level(self._info.getSlotId(), @intCast(channel)));
     }
 
-    pub fn getName(self: ProjectFn) ?[]const u8 {
+    pub fn getName(self: Self) ?[]const u8 {
         const result = sv.sv_get_song_name(self._info.getSlotId());
         if (result == null) return null;
         return @ptrCast(result);
     }
 
-    pub fn setName(self: ProjectFn, name: []const u8) SvError!void {
+    pub fn setName(self: Self, name: []const u8) SvError!void {
         const result = sv.sv_set_song_name(self._info.getSlotId(), @ptrCast(name.ptr));
         if (result < 0) return SvError.FailedToSetProjectName;
     }
 
-    pub fn getBPM(self: ProjectFn) SvError!u32 {
+    pub fn getBPM(self: Self) SvError!u32 {
         return @intCast(sv.sv_get_song_bpm(self._info.getSlotId()));
     }
 
-    pub fn getTPL(self: ProjectFn) SvError!u32 {
+    pub fn getTPL(self: Self) SvError!u32 {
         return @intCast(sv.sv_get_song_tpl(self._info.getSlotId()));
     }
 
-    pub fn getLengthBySamepleFrameCount(self: ProjectFn) SvError!u32 {
+    pub fn getLengthBySamepleFrameCount(self: Self) SvError!u32 {
         return @intCast(sv.sv_get_song_length_frames(self._info.getSlotId()));
     }
 
-    pub fn getLengthByLineCount(self: ProjectFn) SvError!u32 {
+    pub fn getLengthByLineCount(self: Self) SvError!u32 {
         return @intCast(sv.sv_get_song_length_lines(self._info.getSlotId()));
     }
 
@@ -624,25 +762,26 @@ const ProjectFn = struct {
 };
 
 const EventFn = struct {
+    const Self = @This();
     _info: *SlotInfo = undefined,
 
-    pub fn minimizeEventSendLatency(self: EventFn) SvError!void {
+    pub fn minimizeSendLatency(self: Self) SvError!void {
         const result = sv.sv_set_event_t(self._info.getSlotId(), 1, 0);
         if (result < 0) return SvError.FailedToChangeEventSendLatency;
     }
 
-    pub fn autoEventSendLatency(self: EventFn) SvError!void {
+    pub fn autoSendLatency(self: Self) SvError!void {
         const result = sv.sv_set_event_t(self._info.getSlotId(), 0, 0);
         if (result < 0) return SvError.FailedToChangeEventSendLatency;
     }
 
-    pub fn setEventSendLatency(self: EventFn, system_tick: i32) SvError!void {
+    pub fn setSendLatency(self: Self, system_tick: i32) SvError!void {
         const result = sv.sv_set_event_t(self._info.getSlotId(), 0, @intCast(system_tick));
         if (result < 0) return SvError.FailedToChangeEventSendLatency;
     }
 
-    pub fn sendEventFull(
-        self: EventFn,
+    pub fn sendFull(
+        self: Self,
         event: struct {
             track: u8 = 0, // SunVox pattern only support 32 tracks, so u8 is sufficient
             note: u8 = 0,
@@ -666,6 +805,151 @@ const EventFn = struct {
     }
 };
 
+// originally, I wanted to opaquify the module type such that users can access the module
+// at a higher level without caring the actual module index; however, this means I need
+// add an additional layer between the original library and the user project, creating some
+// tracking properties to ensure the user and the library side are in sync, which could
+// cause memory leak and data desync easily if they are not managed properly. Besides,
+// I can't find a good solution to connect and disconnect existing modules that is not
+// opaquified during project load; as a result, I will ended up with a bunch of confusing
+// helper functions to handle both opaquified and non-opaquified modules.
+//
+// Thus, the aforementioned idea has been scraped, and just expose the function instead.
+const ModuleFn = struct {
+    const Self = @This();
+    _info: *SlotInfo = undefined,
+
+    pub fn new(self: Self, module_type: ModuleType, name: ?[]u8, x: i32, y: i32, z_layers: u3) SvError!u32 {
+        if (!self._info.isLocked()) return SvError.LockRequired;
+
+        const module_id = sv.sv_new_module(
+            self._info.getSlotId(),
+            getModuleName(module_type),
+            if (name) |n| n.ptr else getModuleName(module_type),
+            @intCast(x),
+            @intCast(y),
+            @intCast(z_layers),
+        );
+
+        return if (module_id < 0) SvError.FailedToCreateModule else module_id;
+    }
+
+    pub fn remove(self: Self, module_id: u32) SvError!void {
+        if (!self._info.isLocked()) return SvError.LockRequired;
+        const result = sv.sv_remove_module(self._info.getSlotId(), @intCast(module_id));
+        if (result < 0) return SvError.FailedToRemoveModule;
+    }
+
+    pub fn connect(self: Self, from_module_id: u32, to_module_id: 32) SvError!void {
+        if (!self._info.isLocked()) return SvError.LockRequired;
+        const result = sv.sv_connect_module(self._info.getSlotId(), @intCast(from_module_id), @intCast(to_module_id));
+        if (result < 0) return SvError.FailedToConnectModule;
+    }
+
+    pub fn disconnect(self: Self, from_module_id: u32, to_module_id: 32) SvError!void {
+        if (!self._info.isLocked()) return SvError.LockRequired;
+        const result = sv.sv_disconnect_module(self._info.getSlotId(), @intCast(from_module_id), @intCast(to_module_id));
+        if (result < 0) return SvError.FailedToDisconnectedModule;
+    }
+
+    pub fn load(self: Self, file_path: []const u8, x: i32, y: i32, z_layers: u3) SvError!u32 {
+        if (!self._info.isLocked()) return SvError.LockRequired;
+        const module_id = sv.sv_load_module(self._info.getSlotId(), file_path.ptr, x, y, z_layers);
+        return if (module_id < 0) SvError.FailedToCreateModule else module_id;
+    }
+
+    pub fn loadFromMemory(self: Self, data: []const u8, x: i32, y: i32, z_layers: u3) SvError!u32 {
+        if (!self._info.isLocked()) return SvError.LockRequired;
+        const module_id = sv.sv_load_module_from_memory(self._info.getSlotId(), data.ptr, data.len, x, y, z_layers);
+        return if (module_id < 0) SvError.FailedToCreateModule else module_id;
+    }
+
+    pub fn loadSample(self: Self, module_id: u32, sample_file_path: []const u8, sample_slot: u32) SvError!void {
+        if (!self.isType(module_id, .Sampler)) return SvError.NotSampler;
+        return try self.loadSampleUnsafe(module_id, sample_file_path, sample_slot);
+    }
+
+    /// This is the wrapper function for the original sv_sampler_load which it doesn't have module type check, which
+    /// might result in a confusing error if you have applied a non-sampler module.
+    pub fn loadSampleUnsafe(self: Self, module_id: u32, sample_file_path: []const u8, sample_slot: u32) SvError!void {
+        const result = sv.sv_sampler_load(self._info.getSlotId(), @intCast(module_id), sample_file_path.ptr, @intCast(sample_slot));
+        return if (result < 0) return SvError.FailedToLoadSample;
+    }
+
+    pub fn loadSampleFromMemory(self: Self, module_id: u32, raw_sample_data: []u8, sample_slot: u32) SvError!void {
+        if (!self.isType(module_id, .Sampler)) return SvError.NotSampler;
+        return try self.loadSampleFromMemoryUnsafe(module_id, raw_sample_data, sample_slot);
+    }
+
+    /// This is the wrapper function for the original sv_sampler_load_from_memory which it doesn't have module type check, which
+    /// might result in a confusing error if you have applied a non-sampler module.
+    pub fn loadSampleFromMemoryUnsafe(self: Self, module_id: u32, raw_sample_data: []u8, sample_slot: u32) SvError!void {
+        const result = sv.sv_sampler_load_from_memory(self._info.getSlotId(), module_id, raw_sample_data.ptr, @intCast(raw_sample_data.len), @intCast(sample_slot));
+        return if (result < 0) return SvError.FailedToLoadSample;
+    }
+
+    pub fn getSamplerParam(self: Self, module_id: u32, sample_slot: u32, param_type: SamplerProperties) SvError!SamplerParamValues {
+        if (!self.isType(module_id, .Sampler)) return SvError.NotSampler;
+        return try self.getSamplerParam(module_id, sample_slot, param_type);
+    }
+
+    pub fn getSamplerParamUnsafe(self: ModuleFn, module_id: u32, sample_slot: u32, param_type: SamplerProperties) SamplerParamValues {
+        const result = sv.sv_sampler_par(self._info.getSlotId(), module_id, sample_slot, @intFromEnum(param_type), 0, 0);
+        return SamplerParamValues{ .int = result };
+    }
+
+    pub fn setSamplerParam(self: Self, module_id: u32, sample_slot: u32, param_type: SamplerProperties, param_val: SamplerParamValues) SvError!SamplerParamValues {
+        if (!self.isType(module_id, .Sampler)) return SvError.NotSampler;
+        return try self.setSamplerParamUnsafe(module_id, sample_slot, param_type, param_val);
+    }
+
+    pub fn setSamplerParamUnsafe(self: Self, module_id: u32, sample_slot: u32, param_type: SamplerProperties, param_val: SamplerParamValues) SvError!SamplerParamValues {
+        const result = sv.sv_sampler_par(self._info.getSlotId(), module_id, sample_slot, param_type, param_val, 1);
+        return SamplerParamValues{ .int = result };
+    }
+
+    pub fn loadSunVoxProjectToMetaModule(self: Self, module_id: u32, sunvox_project_file_path: []const u8) SvError!void {
+        if (!self.isType(module_id, .MetaModule)) return SvError.NotMetaModule;
+        return self.loadSunVoxProjectToMetaModuleUnsafe(module_id, sunvox_project_file_path);
+    }
+
+    pub fn loadSunVoxProjectToMetaModuleUnsafe(self: Self, module_id: u32, sunvox_project_file_path: []const u8) SvError!void {
+        const result = sv.sv_metamodule_load(self._info.getSlotId(), module_id, sunvox_project_file_path.ptr);
+        return if (result < 0) return SvError.FailedToLoadProject;
+    }
+
+    pub fn loadSunVoxProjectToMetaModuleFromMemory(self: Self, module_id: u32, raw_sunvox_project_data: []u8) SvError!void {
+        if (!self.isType(module_id, .MetaModule)) return SvError.NotMetaModule;
+        return try self.loadSunVoxProjectToMetaModuleFromMemoryUnsafe(module_id, raw_sunvox_project_data);
+    }
+
+    pub fn loadSunVoxProjectToMetaModuleFromMemoryUnsafe(self: Self, module_id: u32, raw_sunvox_project_data: []u8) SvError!void {
+        const result = sv.sv_metamodule_load_from_memory(self._info.getSlotId(), module_id, raw_sunvox_project_data.ptr, @intCast(raw_sunvox_project_data.len));
+        return if (result < 0) return SvError.FailedToLoadProject;
+    }
+
+    // I am going to skip vorbis player module for now because they are not frequently used
+    // TODO: sv_vplayer_load()
+    // TODO: sv_vplayer_load_from_memory()
+
+    // TODO: Following task: Implement sv_get_number_of_modules() and beyond
+
+    pub fn getTypeAsString(self: Self, module_id: u32) ?[]const u8 {
+        const module_type = sv.sv_get_module_type(self._info.getSlotId(), @intCast(module_id));
+        if (module_type == null) return null else return @constCast(module_type);
+    }
+
+    pub fn getType(self: Self, module_id: u32) ?ModuleType {
+        const module_type = self.getTypeAsString(module_id);
+        if (module_type) |mt| return std.meta.stringToEnum(ModuleType, mt) else return null;
+    }
+
+    pub fn isType(self: Self, module_id: u32, target_type: ModuleType) bool {
+        const module_type = self.getType(module_id);
+        return (module_type != null and module_type.? == target_type);
+    }
+};
+
 test "init sunvox library; create and destory SunVox Instances" {
     const version = try init(null, 44100, 2, 0);
     defer deinit();
@@ -680,9 +964,9 @@ test "init sunvox library; create and destory SunVox Instances" {
     // Create and Validate Slots
     const allocator = std.testing.allocator;
 
-    const slot_a = try Slot().create(allocator);
-    const slot_b = try Slot().create(allocator);
-    const slot_c = try Slot().create(allocator);
+    const slot_a = try Slot.create(allocator);
+    const slot_b = try Slot.create(allocator);
+    const slot_c = try Slot.create(allocator);
 
     const err_msg = "Failed to destroy SunVox Slot";
     defer slot_a.destroy() catch @panic(err_msg);
@@ -714,7 +998,7 @@ test "project level function" {
     defer deinit();
 
     const allocator = std.testing.allocator;
-    var slot = try Slot().create(allocator);
+    var slot = try Slot.create(allocator);
     defer slot.destroy() catch {};
 
     // These are the default sunvox project settings
@@ -757,3 +1041,7 @@ test "project level function" {
 // It would be cool if I can generate a patch by:
 //
 // const module: u32 = sunvox_slot.Notey(.yep).PLEASE_ANSWER_PLEASE();
+
+test "module name" {
+    std.debug.print("{s}", .{getModuleName(.Analog_generator)});
+}
