@@ -254,7 +254,7 @@ fn getModuleName(module_type: ModuleType) []const u8 {
     };
 }
 
-const SamplerProperties = enum(c_int) {
+pub const SamplerProperties = enum(c_int) {
     LoopBeginPosition = 0,
     LoopDuration,
     LoopType,
@@ -266,23 +266,23 @@ const SamplerProperties = enum(c_int) {
     StartPosition,
 };
 
-const SamplerLoopType = enum(c_int) {
+pub const SamplerLoopType = enum(c_int) {
     Forward = 0,
     PingPong,
 };
 
-const LoopReleaseFlag = enum(c_int) {
+pub const LoopReleaseFlag = enum(c_int) {
     None = 0,
     LoopFinishAfterRelease,
 };
 
-const SamplerParamValues = packed union {
+pub const SamplerParamValues = packed union {
     int: c_int,
     loop_type: SamplerLoopType,
     loop_release_flag: LoopReleaseFlag,
 };
 
-const ModuleFlags = packed union {
+pub const ModuleFlags = packed union {
     raw: u32,
     flags: packed struct {
         is_exist: bool,
@@ -296,7 +296,7 @@ const ModuleFlags = packed union {
     },
 };
 
-const ModuleLocation = packed union {
+pub const ModuleLocation = packed union {
     raw: u32,
     axis: struct {
         x: u16,
@@ -304,7 +304,7 @@ const ModuleLocation = packed union {
     },
 };
 
-const Color = packed union {
+pub const Color = packed union {
     raw: u32,
     col: struct {
         r: u8,
@@ -313,12 +313,18 @@ const Color = packed union {
     },
 };
 
-const PitchProperties = packed union {
+pub const PitchProperties = packed union {
     raw: u32,
     pitch: struct {
         rel: u16,
         fine: u16,
     },
+};
+
+pub const MultiSynthCurveType = enum(c_int) {
+    curve1_note_to_vel = 0,
+    curve2_vel_to_vel,
+    curve3_note_to_pitch,
 };
 
 // Here are the list of errors for the library, to replace the negative value used for the original library
@@ -354,6 +360,7 @@ const SvError = error{
     LockRequired,
     NotSampler,
     NotMetaModule,
+    NotMultiSynth,
     FailedToLoadSample,
     SampleParameterNotFound,
     ModuleNotFound,
@@ -363,6 +370,7 @@ const SvError = error{
     FailedToSetModuleColor,
     FailedToSetModuleRelNote,
     FailedToSetModuleFinetune,
+    FailedToAccessModuleCurve,
 };
 
 /// The original library requires the user to specify the sunvox instance ID (aka slot_id)
@@ -1072,6 +1080,42 @@ const ModuleFn = struct {
     pub fn getScope(self: Self, module_id: u32, channel: u32, out_buffer: []u16) u32 {
         const result = sv.sv_get_module_scope2(self._info.getSlotId(), @intCast(module_id), @intCast(channel), @ptrCast(out_buffer.ptr), @intCast(out_buffer.len));
         return @intCast(result);
+    }
+
+    pub fn getScopeAlloc(self: Self, allocator: std.mem.Allocator, module_id: u32, channel: u32, sample_size: usize) anyerror!*[]u16 {
+        const out_buffer = try allocator.alloc(u16, sample_size);
+        self.getScope(module_id, channel, out_buffer);
+        return out_buffer;
+    }
+
+    /// This function is written to support the original function sv_module_curve(), but unless
+    /// you are working on a highly time critical task, you should always use getMultiSynthCurve,
+    /// getWaveShaperCurve, and etc since they have validation and builtin allocation such that
+    /// you can ensure your module curve has accessed correctly and with a consistent type.
+    pub fn getCurve(self: Self, module_id: u32, curve_id: u32, out_buffer: []f32) SvError![]f32 {
+        const result = sv.sv_module_curve(self._info.getSlotId(), @intCast(module_id), @intCast(curve_id), @ptrCast(out_buffer.ptr), @intCast(out_buffer.len), 0);
+        if (result < 0) return SvError.FailedToAccessModuleCurve else return out_buffer;
+    }
+
+    pub fn getCurveMultiSynth(self: Self, allocator: std.mem.Allocator, module_id: u32, curve_type: MultiSynthCurveType) anyerror![]f32 {
+        if (!self.isType(module_id, .MultiSynth)) return SvError.NotMultiSynth;
+        const buffer = switch (curve_type) {
+            .curve1_note_to_vel => try allocator.alloc(f32, 128),
+            .curve2_vel_to_vel => try allocator.alloc(f32, 127),
+            .curve3_note_to_pitch => try allocator.alloc(f32, 128),
+        };
+
+        self.getCurve(module_id, @intFromEnum(curve_type), buffer);
+        return buffer;
+    }
+
+    /// This function is written to support the original function sv_module_curve(), but unless
+    /// you are working on a highly time critical task, you should always use setMultiSynthCurve,
+    /// setWaveShaperCurve, and etc since they have validation such that you can ensure your
+    /// module curve has accessed correctly and with a consistent type.
+    pub fn setCurve(self: Self, module_id: u32, curve_id: u32, out_buffer: []f32) SvError!void {
+        const result = sv.sv_module_curve(self._info.getSlotId(), @intCast(module_id), @intCast(curve_id), @ptrCast(out_buffer.ptr), @intCast(out_buffer.len), 1);
+        if (result < 0) return SvError.FailedToAccessModuleCurve else return out_buffer;
     }
 };
 
