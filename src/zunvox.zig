@@ -282,6 +282,45 @@ const SamplerParamValues = packed union {
     loop_release_flag: LoopReleaseFlag,
 };
 
+const ModuleFlags = packed union {
+    raw: u32,
+    flags: packed struct {
+        is_exist: bool,
+        is_generator: bool,
+        is_effect: bool,
+        is_muted: bool,
+        is_bypassed: bool,
+        _padding: u11,
+        inputs_mask: u8,
+        outputs_mask: u8,
+    },
+};
+
+const ModuleLocation = packed union {
+    raw: u32,
+    axis: struct {
+        x: u16,
+        y: u16,
+    },
+};
+
+const Color = packed union {
+    raw: u32,
+    col: struct {
+        r: u8,
+        g: u8,
+        b: u8,
+    },
+};
+
+const PitchProperties = packed union {
+    raw: u32,
+    pitch: struct {
+        rel: u16,
+        fine: u16,
+    },
+};
+
 // Here are the list of errors for the library, to replace the negative value used for the original library
 // so that to provide a clearer ideas of what goes wrong with your projects
 const SvError = error{
@@ -317,6 +356,13 @@ const SvError = error{
     NotMetaModule,
     FailedToLoadSample,
     SampleParameterNotFound,
+    ModuleNotFound,
+    FailedToGetModuleFlag,
+    FailedToSetModuleName,
+    FailedToSetModuleLocation,
+    FailedToSetModuleColor,
+    FailedToSetModuleRelNote,
+    FailedToSetModuleFinetune,
 };
 
 /// The original library requires the user to specify the sunvox instance ID (aka slot_id)
@@ -579,9 +625,10 @@ pub fn getSampleRate() !u32 {
 pub const Slot = struct {
     const Self = @This();
     _info: *SlotInfo = undefined,
-    _allocator: std.mem.Allocator = undefined,
+    // _allocator: std.mem.Allocator = undefined,
     Project: ProjectFn = ProjectFn{},
     Event: EventFn = EventFn{},
+    Module: ModuleFn = ModuleFn{},
 
     // instance construction and destruction
     pub fn create(allocator: std.mem.Allocator) anyerror!Self {
@@ -596,7 +643,7 @@ pub const Slot = struct {
                 private_field.slot_id = @intCast(i);
 
                 var slot = Self{};
-                slot.setupSlot(allocator, @ptrCast(private_field));
+                slot.setupSlot(@ptrCast(private_field));
 
                 return slot;
             }
@@ -604,14 +651,14 @@ pub const Slot = struct {
         return SvError.MaximumSlotExceeded;
     }
 
-    fn setupSlot(self: *Self, allocator: std.mem.Allocator, slot_info: *SlotInfo) void {
-        self._allocator = allocator;
+    fn setupSlot(self: *Self, slot_info: *SlotInfo) void {
         self._info = slot_info;
         self.Project._info = slot_info;
         self.Event._info = slot_info;
+        self.Module._info = slot_info;
     }
 
-    pub fn destroy(self: Self) SvError!void {
+    pub fn destroy(self: Self, allocator: std.mem.Allocator) SvError!void {
         const slot_id = self._info.getSlotId();
         if (slot_state_list[@intCast(slot_id)]) {
             if (sv.sv_close_slot(slot_id) != 0) {
@@ -619,7 +666,7 @@ pub const Slot = struct {
             }
 
             // Clear off the private object, and release the instance_tracker state to inactive
-            self._allocator.destroy(@as(*SlotPrivateField, @ptrCast(@alignCast(self._info))));
+            allocator.destroy(@as(*SlotPrivateField, @ptrCast(@alignCast(self._info))));
             slot_state_list[@intCast(slot_id)] = false;
         } else {
             return SvError.SlotAlreadyDestroyed;
@@ -932,11 +979,39 @@ const ModuleFn = struct {
     // TODO: sv_vplayer_load()
     // TODO: sv_vplayer_load_from_memory()
 
-    // TODO: Following task: Implement sv_get_number_of_modules() and beyond
+    /// This was the original function of sv_get_number_of_modules(), but since the function
+    /// technically returns the largest possible module ID in the project, I decided to rename
+    /// the function and reserve the name for another fucntion that actually counts.
+    pub fn getLargestID(self: Self) u32 {
+        return sv.sv_get_number_of_modules(self._info.getSlotId());
+    }
+
+    pub fn foundByName(self: Self, module_name: []const u8) SvError!u32 {
+        const module_id = sv.sv_find_module(self._info.getSlotId(), @constCast(module_name.ptr));
+        return if (module_id < 0) return SvError.ModuleNotFound else return module_id;
+    }
 
     pub fn getTypeAsString(self: Self, module_id: u32) ?[]const u8 {
         const module_type = sv.sv_get_module_type(self._info.getSlotId(), @intCast(module_id));
         if (module_type == null) return null else return @constCast(module_type);
+    }
+
+    pub fn getFlags(self: Self, module_id: u32) SvError!ModuleFlags {
+        const result = sv.sv_get_module_flags(self._info.getSlotId(), @intCast(module_id));
+        // TODO: since the original function returns u32, I am not sure why it return -1 when there is an error
+        // I will take a deeper look to see how this function returns an error, either it is the 2'com
+        // representation of the -1 or using other number as an error.
+        return ModuleFlags{ .raw = @intCast(result) };
+    }
+
+    pub fn getModuleInputs(self: Self, module_id: u32) ?[]u32 {
+        const result = sv.sv_get_module_inputs(self._info.getSlotId(), @intCast(module_id));
+        if (result == null) return null else return @ptrCast(result);
+    }
+
+    pub fn getModuleOutputs(self: Self, module_id: u32) ?[]u32 {
+        const result = sv.sv_get_module_outputs(self._info.getSlotId(), @intCast(module_id));
+        if (result == null) return null else return @ptrCast(result);
     }
 
     pub fn getType(self: Self, module_id: u32) ?ModuleType {
@@ -947,6 +1022,56 @@ const ModuleFn = struct {
     pub fn isType(self: Self, module_id: u32, target_type: ModuleType) bool {
         const module_type = self.getType(module_id);
         return (module_type != null and module_type.? == target_type);
+    }
+
+    pub fn getName(self: Self, module_id: u32) ?[]const u8 {
+        const module_name = sv.sv_get_module_name(self._info.getSlotId(), @intCast(module_id));
+        if (module_name == null) return null else return @constCast(module_name);
+    }
+
+    pub fn setName(self: Self, module_id: u32, module_name: []const u8) SvError!void {
+        const result = sv.sv_set_module_name(self._info.getSlotId(), @intCast(module_id), @constCast(module_name.ptr));
+        if (result < 0) return SvError.FailedToSetName;
+    }
+
+    pub fn getLocation(self: Self, module_id: u32) ModuleLocation {
+        const position = sv.sv_get_module_xy(self._info.getSlotId(), @intCast(module_id));
+        return ModuleLocation{ .raw = position };
+    }
+
+    pub fn setLocation(self: Self, module_id: u32, location: ModuleLocation) SvError!void {
+        const result = sv.sv_set_module_xy(self._info.getSlotId(), @intCast(module_id), location.axis.x, location.axis.y);
+        if (result < 0) return SvError.FailedToSetModuleLocation;
+    }
+
+    pub fn getColor(self: Self, module_id: u32) Color {
+        const color = sv.sv_get_module_color(self._info.getSlotId(), @intCast(module_id));
+        return Color{ .raw = @intCast(color) };
+    }
+
+    pub fn setColor(self: Self, module_id: u32, color: Color) SvError!void {
+        const result = sv.sv_set_module_color(self._info.getSlotId(), @intCast(module_id), @intCast(color.raw));
+        if (result < 0) return SvError.FailedToSetModuleColor;
+    }
+
+    pub fn getPitchProperties(self: Self, module_id: u32) PitchProperties {
+        const pitch_prop = sv.sv_get_module_finetune(self._info.getSlotId(), @intCast(module_id));
+        return PitchProperties{ .raw = @ptrCast(pitch_prop) };
+    }
+
+    pub fn setRelNote(self: Self, module_id: u32, rel_note: u16) SvError!void {
+        const result = sv.sv_set_module_relnote(self._info.getSlotId(), @intCast(module_id), @intCast(rel_note));
+        return if (result < 0) return SvError.FailedToSetModuleRelNote;
+    }
+
+    pub fn setFineTune(self: Self, module_id: u32, finetune: u16) SvError!void {
+        const result = sv.sv_set_module_finetune(self._info.getSlotId(), @intCast(module_id), @intCast(finetune));
+        return if (result < 0) return SvError.FailedToSetModuleFinetune;
+    }
+
+    pub fn getScope(self: Self, module_id: u32, channel: u32, out_buffer: []u16) u32 {
+        const result = sv.sv_get_module_scope2(self._info.getSlotId(), @intCast(module_id), @intCast(channel), @ptrCast(out_buffer.ptr), @intCast(out_buffer.len));
+        return @intCast(result);
     }
 };
 
@@ -969,9 +1094,9 @@ test "init sunvox library; create and destory SunVox Instances" {
     const slot_c = try Slot.create(allocator);
 
     const err_msg = "Failed to destroy SunVox Slot";
-    defer slot_a.destroy() catch @panic(err_msg);
-    defer slot_b.destroy() catch @panic(err_msg);
-    defer slot_c.destroy() catch @panic(err_msg);
+    defer slot_a.destroy(allocator) catch @panic(err_msg);
+    defer slot_b.destroy(allocator) catch @panic(err_msg);
+    defer slot_c.destroy(allocator) catch @panic(err_msg);
 
     // validate the instance (slot) ID; however, the use of _private in your
     // project is strongly discouraged because it will cause instance tracking
@@ -999,7 +1124,7 @@ test "project level function" {
 
     const allocator = std.testing.allocator;
     var slot = try Slot.create(allocator);
-    defer slot.destroy() catch {};
+    defer slot.destroy(allocator) catch {};
 
     // These are the default sunvox project settings
     try expectEqual(125, slot.Project.getBPM());
@@ -1043,5 +1168,14 @@ test "project level function" {
 // const module: u32 = sunvox_slot.Notey(.yep).PLEASE_ANSWER_PLEASE();
 
 test "module name" {
-    std.debug.print("{s}", .{getModuleName(.Analog_generator)});
+    _ = try init(null, 44100, 2, 0);
+    defer deinit();
+
+    const allocator = std.testing.allocator;
+    var slot = try Slot.create(allocator);
+    defer slot.destroy(allocator) catch {};
+
+    const result = ModuleFlags{ .raw = sv.sv_get_module_flags(-1, -1) };
+
+    std.debug.print("result in error: {x}", .{result.raw});
 }
