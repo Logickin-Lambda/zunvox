@@ -207,7 +207,7 @@ const SunVoxFunctionTable = struct {
 };
 
 // Module Lkup for creating the modules since sunvox passes strings instead of enums or index for module typing
-fn getModuleName(module_type: ModuleType) []const u8 {
+fn getModuleTypeStr(module_type: ModuleType) []const u8 {
     return switch (module_type) {
         .Analog_generator => "Analog generator",
         .DrumSynth => "DrumSynth",
@@ -251,6 +251,7 @@ fn getModuleName(module_type: ModuleType) []const u8 {
         .Pitch_Detector => "Pitch_Detector",
         .Sound2Ctl => "Sound2Ctl",
         .Velocity2Ctl => "Velocity2Ctl",
+        .Output => "Output",
     };
 }
 
@@ -379,6 +380,7 @@ const SvError = error{
 const SlotPrivateField = struct {
     slot_id: c_int, // The original library capped the number of slots at 16
     is_locked: bool = false,
+    active_module_list: std.AutoHashMap(c_int, *Module),
 };
 
 /// to prevent user modifying the private field which will corrupt the slot_state_list
@@ -404,7 +406,26 @@ const SlotInfo = opaque {
         const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
         private_field.is_locked = false;
     }
+
+    fn register_module(self: *SlotInfo, module: *Module) !void {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        try private_field.active_module_list.put(c_int, module);
+    }
+
+    fn remove_module(self: *SlotInfo, module_id: c_int) bool {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        return private_field.active_module_list.remove(module_id);
+    }
 };
+
+/// The objective of this library is to hide all the manual index for most of the functions,
+const ModulePrivateField = struct {
+    slot_info: *SlotInfo = undefined,
+    module_id: c_int,
+    module_type: ModuleType,
+};
+
+const ModuleInfo = opaque {};
 
 const SunVoxVersion = packed union {
     raw: u32,
@@ -474,7 +495,7 @@ pub const ModuleType = enum(u8) {
     Vocal_filter,
     Vibrato,
     Waveshaper,
-    //misc
+    // misc
     ADSR,
     Ctl2Note,
     Feedback,
@@ -487,6 +508,8 @@ pub const ModuleType = enum(u8) {
     Pitch_Detector,
     Sound2Ctl,
     Velocity2Ctl,
+    /// NON ASSIGNABLE, Only used for type check
+    Output,
 };
 
 /// This combines the original sv_load_dll() and sv_init() function because
@@ -636,7 +659,6 @@ pub const Slot = struct {
     // _allocator: std.mem.Allocator = undefined,
     Project: ProjectFn = ProjectFn{},
     Event: EventFn = EventFn{},
-    Module: ModuleFn = ModuleFn{},
 
     // instance construction and destruction
     pub fn create(allocator: std.mem.Allocator) anyerror!Self {
@@ -649,6 +671,7 @@ pub const Slot = struct {
 
                 var private_field = try allocator.create(SlotPrivateField);
                 private_field.slot_id = @intCast(i);
+                private_field.active_module_list = std.AutoHashMap(c_int, *Module).init(allocator);
 
                 var slot = Self{};
                 slot.setupSlot(@ptrCast(private_field));
@@ -663,7 +686,6 @@ pub const Slot = struct {
         self._info = slot_info;
         self.Project._info = slot_info;
         self.Event._info = slot_info;
-        self.Module._info = slot_info;
     }
 
     pub fn destroy(self: Self, allocator: std.mem.Allocator) SvError!void {
@@ -860,262 +882,54 @@ const EventFn = struct {
     }
 };
 
-// originally, I wanted to opaquify the module type such that users can access the module
-// at a higher level without caring the actual module index; however, this means I need
-// add an additional layer between the original library and the user project, creating some
-// tracking properties to ensure the user and the library side are in sync, which could
-// cause memory leak and data desync easily if they are not managed properly. Besides,
-// I can't find a good solution to connect and disconnect existing modules that is not
-// opaquified during project load; as a result, I will ended up with a bunch of confusing
-// helper functions to handle both opaquified and non-opaquified modules.
-//
-// Thus, the aforementioned idea has been scraped, and just expose the function instead.
-const ModuleFn = struct {
-    const Self = @This();
-    _info: *SlotInfo = undefined,
+const Module = opaque {
+    /// You SHOULDN'T call this function at all because this is used for the internal library,
+    /// mapping the modules during the project load so that you can process modules at higher levels.
+    /// Although calling the function won't have any effects because modules should be recorded in
+    /// the Slot type once the project has been loaded, It is strongly discouraged to call this
+    /// function because you have wasted time on running module existance and type checks instead
+    /// of doing anything useful.
+    pub fn opacify(allocator: std.mem.Allocator, slot_info: *SlotInfo, module_id: c_int) !*Module {
+        // Since we have ensured that module slot is not empty, unless there is an update while I haven't update the library,
+        // ModuleType should covers all the possible built-in module type. User modules should only appeared as MetaModule.
+        const module_type = std.meta.stringToEnum(ModuleType, @ptrCast(sv.sv_get_module_type(slot_info.getSlotId(), module_id)));
+        if (module_type == null) return SvError.ModuleNotFound;
 
-    pub fn new(self: Self, module_type: ModuleType, name: ?[]u8, x: i32, y: i32, z_layers: u3) SvError!u32 {
-        if (!self._info.isLocked()) return SvError.LockRequired;
+        var module = try allocator.create(ModulePrivateField);
+        module.module_id = module_id;
+        module.module_type = module_type;
+        module.slot_info = slot_info;
 
-        const module_id = sv.sv_new_module(
-            self._info.getSlotId(),
-            getModuleName(module_type),
-            if (name) |n| n.ptr else getModuleName(module_type),
+        // register the module_into the slot:
+
+        return @ptrCast(&module);
+    }
+
+    pub fn new(allocator: std.mem.Allocator, slot: Slot, module_type: ModuleType, _: ?[]const u8, x: i32, y: i32, z_layers: u8) !*Module {
+        const result = sv.sv_new_module(
+            0,
+            // @constCast(getModuleTypeStr(module_type).ptr),
+            //if (name) |n| @constCast(n.ptr) else @constCast(getModuleTypeStr(module_type).ptr),
+            @constCast("ADSR"),
+            @constCast("NOTEY"),
             @intCast(x),
             @intCast(y),
             @intCast(z_layers),
         );
 
-        return if (module_id < 0) SvError.FailedToCreateModule else module_id;
+        if (result < 0) return SvError.FailedToCreateModule;
+
+        var module = try allocator.create(ModulePrivateField);
+        module.module_id = result;
+        module.module_type = module_type;
+        module.slot_info = slot._info;
+
+        return @ptrCast(module);
     }
 
-    pub fn remove(self: Self, module_id: u32) SvError!void {
-        if (!self._info.isLocked()) return SvError.LockRequired;
-        const result = sv.sv_remove_module(self._info.getSlotId(), @intCast(module_id));
-        if (result < 0) return SvError.FailedToRemoveModule;
-    }
-
-    pub fn connect(self: Self, from_module_id: u32, to_module_id: 32) SvError!void {
-        if (!self._info.isLocked()) return SvError.LockRequired;
-        const result = sv.sv_connect_module(self._info.getSlotId(), @intCast(from_module_id), @intCast(to_module_id));
-        if (result < 0) return SvError.FailedToConnectModule;
-    }
-
-    pub fn disconnect(self: Self, from_module_id: u32, to_module_id: 32) SvError!void {
-        if (!self._info.isLocked()) return SvError.LockRequired;
-        const result = sv.sv_disconnect_module(self._info.getSlotId(), @intCast(from_module_id), @intCast(to_module_id));
-        if (result < 0) return SvError.FailedToDisconnectedModule;
-    }
-
-    pub fn load(self: Self, file_path: []const u8, x: i32, y: i32, z_layers: u3) SvError!u32 {
-        if (!self._info.isLocked()) return SvError.LockRequired;
-        const module_id = sv.sv_load_module(self._info.getSlotId(), file_path.ptr, x, y, z_layers);
-        return if (module_id < 0) SvError.FailedToCreateModule else module_id;
-    }
-
-    pub fn loadFromMemory(self: Self, data: []const u8, x: i32, y: i32, z_layers: u3) SvError!u32 {
-        if (!self._info.isLocked()) return SvError.LockRequired;
-        const module_id = sv.sv_load_module_from_memory(self._info.getSlotId(), data.ptr, data.len, x, y, z_layers);
-        return if (module_id < 0) SvError.FailedToCreateModule else module_id;
-    }
-
-    pub fn loadSample(self: Self, module_id: u32, sample_file_path: []const u8, sample_slot: u32) SvError!void {
-        if (!self.isType(module_id, .Sampler)) return SvError.NotSampler;
-        return try self.loadSampleUnsafe(module_id, sample_file_path, sample_slot);
-    }
-
-    /// This is the wrapper function for the original sv_sampler_load which it doesn't have module type check, which
-    /// might result in a confusing error if you have applied a non-sampler module.
-    pub fn loadSampleUnsafe(self: Self, module_id: u32, sample_file_path: []const u8, sample_slot: u32) SvError!void {
-        const result = sv.sv_sampler_load(self._info.getSlotId(), @intCast(module_id), sample_file_path.ptr, @intCast(sample_slot));
-        return if (result < 0) return SvError.FailedToLoadSample;
-    }
-
-    pub fn loadSampleFromMemory(self: Self, module_id: u32, raw_sample_data: []u8, sample_slot: u32) SvError!void {
-        if (!self.isType(module_id, .Sampler)) return SvError.NotSampler;
-        return try self.loadSampleFromMemoryUnsafe(module_id, raw_sample_data, sample_slot);
-    }
-
-    /// This is the wrapper function for the original sv_sampler_load_from_memory which it doesn't have module type check, which
-    /// might result in a confusing error if you have applied a non-sampler module.
-    pub fn loadSampleFromMemoryUnsafe(self: Self, module_id: u32, raw_sample_data: []u8, sample_slot: u32) SvError!void {
-        const result = sv.sv_sampler_load_from_memory(self._info.getSlotId(), module_id, raw_sample_data.ptr, @intCast(raw_sample_data.len), @intCast(sample_slot));
-        return if (result < 0) return SvError.FailedToLoadSample;
-    }
-
-    pub fn getSamplerParam(self: Self, module_id: u32, sample_slot: u32, param_type: SamplerProperties) SvError!SamplerParamValues {
-        if (!self.isType(module_id, .Sampler)) return SvError.NotSampler;
-        return try self.getSamplerParam(module_id, sample_slot, param_type);
-    }
-
-    pub fn getSamplerParamUnsafe(self: ModuleFn, module_id: u32, sample_slot: u32, param_type: SamplerProperties) SamplerParamValues {
-        const result = sv.sv_sampler_par(self._info.getSlotId(), module_id, sample_slot, @intFromEnum(param_type), 0, 0);
-        return SamplerParamValues{ .int = result };
-    }
-
-    pub fn setSamplerParam(self: Self, module_id: u32, sample_slot: u32, param_type: SamplerProperties, param_val: SamplerParamValues) SvError!SamplerParamValues {
-        if (!self.isType(module_id, .Sampler)) return SvError.NotSampler;
-        return try self.setSamplerParamUnsafe(module_id, sample_slot, param_type, param_val);
-    }
-
-    pub fn setSamplerParamUnsafe(self: Self, module_id: u32, sample_slot: u32, param_type: SamplerProperties, param_val: SamplerParamValues) SvError!SamplerParamValues {
-        const result = sv.sv_sampler_par(self._info.getSlotId(), module_id, sample_slot, param_type, param_val, 1);
-        return SamplerParamValues{ .int = result };
-    }
-
-    pub fn loadSunVoxProjectToMetaModule(self: Self, module_id: u32, sunvox_project_file_path: []const u8) SvError!void {
-        if (!self.isType(module_id, .MetaModule)) return SvError.NotMetaModule;
-        return self.loadSunVoxProjectToMetaModuleUnsafe(module_id, sunvox_project_file_path);
-    }
-
-    pub fn loadSunVoxProjectToMetaModuleUnsafe(self: Self, module_id: u32, sunvox_project_file_path: []const u8) SvError!void {
-        const result = sv.sv_metamodule_load(self._info.getSlotId(), module_id, sunvox_project_file_path.ptr);
-        return if (result < 0) return SvError.FailedToLoadProject;
-    }
-
-    pub fn loadSunVoxProjectToMetaModuleFromMemory(self: Self, module_id: u32, raw_sunvox_project_data: []u8) SvError!void {
-        if (!self.isType(module_id, .MetaModule)) return SvError.NotMetaModule;
-        return try self.loadSunVoxProjectToMetaModuleFromMemoryUnsafe(module_id, raw_sunvox_project_data);
-    }
-
-    pub fn loadSunVoxProjectToMetaModuleFromMemoryUnsafe(self: Self, module_id: u32, raw_sunvox_project_data: []u8) SvError!void {
-        const result = sv.sv_metamodule_load_from_memory(self._info.getSlotId(), module_id, raw_sunvox_project_data.ptr, @intCast(raw_sunvox_project_data.len));
-        return if (result < 0) return SvError.FailedToLoadProject;
-    }
-
-    // I am going to skip vorbis player module for now because they are not frequently used
-    // TODO: sv_vplayer_load()
-    // TODO: sv_vplayer_load_from_memory()
-
-    /// This was the original function of sv_get_number_of_modules(), but since the function
-    /// technically returns the largest possible module ID in the project, I decided to rename
-    /// the function and reserve the name for another fucntion that actually counts.
-    pub fn getLargestID(self: Self) u32 {
-        return sv.sv_get_number_of_modules(self._info.getSlotId());
-    }
-
-    pub fn foundByName(self: Self, module_name: []const u8) SvError!u32 {
-        const module_id = sv.sv_find_module(self._info.getSlotId(), @constCast(module_name.ptr));
-        return if (module_id < 0) return SvError.ModuleNotFound else return module_id;
-    }
-
-    pub fn getTypeAsString(self: Self, module_id: u32) ?[]const u8 {
-        const module_type = sv.sv_get_module_type(self._info.getSlotId(), @intCast(module_id));
-        if (module_type == null) return null else return @constCast(module_type);
-    }
-
-    pub fn getFlags(self: Self, module_id: u32) SvError!ModuleFlags {
-        const result = sv.sv_get_module_flags(self._info.getSlotId(), @intCast(module_id));
-        // TODO: since the original function returns u32, I am not sure why it return -1 when there is an error
-        // I will take a deeper look to see how this function returns an error, either it is the 2'com
-        // representation of the -1 or using other number as an error.
-        return ModuleFlags{ .raw = @intCast(result) };
-    }
-
-    pub fn getModuleInputs(self: Self, module_id: u32) ?[]u32 {
-        const result = sv.sv_get_module_inputs(self._info.getSlotId(), @intCast(module_id));
-        if (result == null) return null else return @ptrCast(result);
-    }
-
-    pub fn getModuleOutputs(self: Self, module_id: u32) ?[]u32 {
-        const result = sv.sv_get_module_outputs(self._info.getSlotId(), @intCast(module_id));
-        if (result == null) return null else return @ptrCast(result);
-    }
-
-    pub fn getType(self: Self, module_id: u32) ?ModuleType {
-        const module_type = self.getTypeAsString(module_id);
-        if (module_type) |mt| return std.meta.stringToEnum(ModuleType, mt) else return null;
-    }
-
-    pub fn isType(self: Self, module_id: u32, target_type: ModuleType) bool {
-        const module_type = self.getType(module_id);
-        return (module_type != null and module_type.? == target_type);
-    }
-
-    pub fn getName(self: Self, module_id: u32) ?[]const u8 {
-        const module_name = sv.sv_get_module_name(self._info.getSlotId(), @intCast(module_id));
-        if (module_name == null) return null else return @constCast(module_name);
-    }
-
-    pub fn setName(self: Self, module_id: u32, module_name: []const u8) SvError!void {
-        const result = sv.sv_set_module_name(self._info.getSlotId(), @intCast(module_id), @constCast(module_name.ptr));
-        if (result < 0) return SvError.FailedToSetName;
-    }
-
-    pub fn getLocation(self: Self, module_id: u32) ModuleLocation {
-        const position = sv.sv_get_module_xy(self._info.getSlotId(), @intCast(module_id));
-        return ModuleLocation{ .raw = position };
-    }
-
-    pub fn setLocation(self: Self, module_id: u32, location: ModuleLocation) SvError!void {
-        const result = sv.sv_set_module_xy(self._info.getSlotId(), @intCast(module_id), location.axis.x, location.axis.y);
-        if (result < 0) return SvError.FailedToSetModuleLocation;
-    }
-
-    pub fn getColor(self: Self, module_id: u32) Color {
-        const color = sv.sv_get_module_color(self._info.getSlotId(), @intCast(module_id));
-        return Color{ .raw = @intCast(color) };
-    }
-
-    pub fn setColor(self: Self, module_id: u32, color: Color) SvError!void {
-        const result = sv.sv_set_module_color(self._info.getSlotId(), @intCast(module_id), @intCast(color.raw));
-        if (result < 0) return SvError.FailedToSetModuleColor;
-    }
-
-    pub fn getPitchProperties(self: Self, module_id: u32) PitchProperties {
-        const pitch_prop = sv.sv_get_module_finetune(self._info.getSlotId(), @intCast(module_id));
-        return PitchProperties{ .raw = @ptrCast(pitch_prop) };
-    }
-
-    pub fn setRelNote(self: Self, module_id: u32, rel_note: u16) SvError!void {
-        const result = sv.sv_set_module_relnote(self._info.getSlotId(), @intCast(module_id), @intCast(rel_note));
-        return if (result < 0) return SvError.FailedToSetModuleRelNote;
-    }
-
-    pub fn setFineTune(self: Self, module_id: u32, finetune: u16) SvError!void {
-        const result = sv.sv_set_module_finetune(self._info.getSlotId(), @intCast(module_id), @intCast(finetune));
-        return if (result < 0) return SvError.FailedToSetModuleFinetune;
-    }
-
-    pub fn getScope(self: Self, module_id: u32, channel: u32, out_buffer: []u16) u32 {
-        const result = sv.sv_get_module_scope2(self._info.getSlotId(), @intCast(module_id), @intCast(channel), @ptrCast(out_buffer.ptr), @intCast(out_buffer.len));
-        return @intCast(result);
-    }
-
-    pub fn getScopeAlloc(self: Self, allocator: std.mem.Allocator, module_id: u32, channel: u32, sample_size: usize) anyerror!*[]u16 {
-        const out_buffer = try allocator.alloc(u16, sample_size);
-        self.getScope(module_id, channel, out_buffer);
-        return out_buffer;
-    }
-
-    /// This function is written to support the original function sv_module_curve(), but unless
-    /// you are working on a highly time critical task, you should always use getMultiSynthCurve,
-    /// getWaveShaperCurve, and etc since they have validation and builtin allocation such that
-    /// you can ensure your module curve has accessed correctly and with a consistent type.
-    pub fn getCurve(self: Self, module_id: u32, curve_id: u32, out_buffer: []f32) SvError![]f32 {
-        const result = sv.sv_module_curve(self._info.getSlotId(), @intCast(module_id), @intCast(curve_id), @ptrCast(out_buffer.ptr), @intCast(out_buffer.len), 0);
-        if (result < 0) return SvError.FailedToAccessModuleCurve else return out_buffer;
-    }
-
-    pub fn getCurveMultiSynth(self: Self, allocator: std.mem.Allocator, module_id: u32, curve_type: MultiSynthCurveType) anyerror![]f32 {
-        if (!self.isType(module_id, .MultiSynth)) return SvError.NotMultiSynth;
-        const buffer = switch (curve_type) {
-            .curve1_note_to_vel => try allocator.alloc(f32, 128),
-            .curve2_vel_to_vel => try allocator.alloc(f32, 127),
-            .curve3_note_to_pitch => try allocator.alloc(f32, 128),
-        };
-
-        self.getCurve(module_id, @intFromEnum(curve_type), buffer);
-        return buffer;
-    }
-
-    /// This function is written to support the original function sv_module_curve(), but unless
-    /// you are working on a highly time critical task, you should always use setMultiSynthCurve,
-    /// setWaveShaperCurve, and etc since they have validation such that you can ensure your
-    /// module curve has accessed correctly and with a consistent type.
-    pub fn setCurve(self: Self, module_id: u32, curve_id: u32, out_buffer: []f32) SvError!void {
-        const result = sv.sv_module_curve(self._info.getSlotId(), @intCast(module_id), @intCast(curve_id), @ptrCast(out_buffer.ptr), @intCast(out_buffer.len), 1);
-        if (result < 0) return SvError.FailedToAccessModuleCurve else return out_buffer;
+    pub fn getModuleType(self: *Module) ModuleType {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        return info.module_type;
     }
 };
 
@@ -1211,7 +1025,7 @@ test "project level function" {
 //
 // const module: u32 = sunvox_slot.Notey(.yep).PLEASE_ANSWER_PLEASE();
 
-test "module name" {
+test "Module Creation Test" {
     _ = try init(null, 44100, 2, 0);
     defer deinit();
 
@@ -1219,7 +1033,9 @@ test "module name" {
     var slot = try Slot.create(allocator);
     defer slot.destroy(allocator) catch {};
 
-    const result = ModuleFlags{ .raw = sv.sv_get_module_flags(-1, -1) };
+    try slot.lock();
+    const module = try Module.new(allocator, slot, .ADSR, "NOTEY", 0, 0, 1);
+    defer allocator.destroy(@as(*ModulePrivateField, @ptrCast(@alignCast(module))));
 
-    std.debug.print("result in error: {x}", .{result.raw});
+    std.debug.print("Module Type: {any}\n", .{module.getModuleType()});
 }
