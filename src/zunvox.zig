@@ -407,14 +407,19 @@ const SlotInfo = opaque {
         private_field.is_locked = false;
     }
 
-    fn register_module(self: *SlotInfo, module: *Module) !void {
+    fn register_module(self: *SlotInfo, module: *Module, module_id: c_int) !void {
         const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
-        try private_field.active_module_list.put(c_int, module);
+        try private_field.active_module_list.put(module_id, module);
     }
 
     fn remove_module(self: *SlotInfo, module_id: c_int) bool {
         const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
         return private_field.active_module_list.remove(module_id);
+    }
+
+    fn peek_module(self: *SlotInfo, module_id: c_int) ?*Module {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        return private_field.active_module_list.get(module_id);
     }
 };
 
@@ -696,7 +701,9 @@ pub const Slot = struct {
             }
 
             // Clear off the private object, and release the instance_tracker state to inactive
-            allocator.destroy(@as(*SlotPrivateField, @ptrCast(@alignCast(self._info))));
+            const slot_info: *SlotPrivateField = @ptrCast(@alignCast(self._info));
+            slot_info.active_module_list.deinit();
+            allocator.destroy(slot_info);
             slot_state_list[@intCast(slot_id)] = false;
         } else {
             return SvError.SlotAlreadyDestroyed;
@@ -889,29 +896,42 @@ const Module = opaque {
     /// the Slot type once the project has been loaded, It is strongly discouraged to call this
     /// function because you have wasted time on running module existance and type checks instead
     /// of doing anything useful.
-    pub fn opacify(allocator: std.mem.Allocator, slot_info: *SlotInfo, module_id: c_int) !*Module {
+    fn opacify(allocator: std.mem.Allocator, slot_info: *SlotInfo, module_id: c_int) !*Module {
         // Since we have ensured that module slot is not empty, unless there is an update while I haven't update the library,
         // ModuleType should covers all the possible built-in module type. User modules should only appeared as MetaModule.
         const module_type = std.meta.stringToEnum(ModuleType, @ptrCast(sv.sv_get_module_type(slot_info.getSlotId(), module_id)));
         if (module_type == null) return SvError.ModuleNotFound;
 
-        var module = try allocator.create(ModulePrivateField);
-        module.module_id = module_id;
-        module.module_type = module_type;
-        module.slot_info = slot_info;
+        var module_field = try allocator.create(ModulePrivateField);
+        module_field.module_id = module_id;
+        module_field.module_type = module_type;
+        module_field.slot_info = slot_info;
 
-        // register the module_into the slot:
+        const module: *Module = @ptrCast(@alignCast(module_field));
+        try slot_info.register_module(module, module_id);
 
-        return @ptrCast(&module);
+        return module;
     }
 
-    pub fn new(allocator: std.mem.Allocator, slot: Slot, module_type: ModuleType, _: ?[]const u8, x: i32, y: i32, z_layers: u8) !*Module {
+    /// You SHOULDN'T call this function at all because this is used for the internal library,
+    /// mapping the modules during the project load so that you can process modules at higher levels.
+    /// Although calling the function won't have any effects because modules should be recorded in
+    /// the Slot type once the project has been loaded, It is strongly discouraged to call this
+    /// function because you have wasted time on running module existance and type checks instead
+    /// of doing anything useful
+    fn deopacify(self: *Module, allocator: std.mem.Allocator) void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        _ = info.slot_info.remove_module(info.module_id);
+        allocator.destroy(info);
+    }
+
+    pub fn new(allocator: std.mem.Allocator, slot: Slot, module_type: ModuleType, name: ?[]const u8, x: i32, y: i32, z_layers: u8) !*Module {
+        if (!slot._info.isLocked()) return SvError.LockRequired;
+
         const result = sv.sv_new_module(
             0,
-            // @constCast(getModuleTypeStr(module_type).ptr),
-            //if (name) |n| @constCast(n.ptr) else @constCast(getModuleTypeStr(module_type).ptr),
-            @constCast("ADSR"),
-            @constCast("NOTEY"),
+            @constCast(getModuleTypeStr(module_type).ptr),
+            if (name) |n| @constCast(n.ptr) else @constCast(getModuleTypeStr(module_type).ptr),
             @intCast(x),
             @intCast(y),
             @intCast(z_layers),
@@ -919,12 +939,24 @@ const Module = opaque {
 
         if (result < 0) return SvError.FailedToCreateModule;
 
-        var module = try allocator.create(ModulePrivateField);
-        module.module_id = result;
-        module.module_type = module_type;
-        module.slot_info = slot._info;
+        var module_field = try allocator.create(ModulePrivateField);
+        module_field.module_id = result;
+        module_field.module_type = module_type;
+        module_field.slot_info = slot._info;
+
+        const module: *Module = @ptrCast(@alignCast(module_field));
+        try slot._info.register_module(module, result);
 
         return @ptrCast(module);
+    }
+
+    pub fn remove(self: *Module, allocator: std.mem.Allocator) !void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        if (!info.slot_info.isLocked()) return SvError.LockRequired;
+
+        if (sv.sv_remove_module(info.slot_info.getSlotId(), info.module_id) < 0) return SvError.FailedToRemoveModule;
+        _ = info.slot_info.remove_module(info.module_id);
+        allocator.destroy(info);
     }
 
     pub fn getModuleType(self: *Module) ModuleType {
@@ -1033,9 +1065,20 @@ test "Module Creation Test" {
     var slot = try Slot.create(allocator);
     defer slot.destroy(allocator) catch {};
 
+    try std.testing.expectError(
+        SvError.LockRequired,
+        Module.new(allocator, slot, .Generator, "NOTEY", 0, 0, 1),
+    );
+
     try slot.lock();
     const module = try Module.new(allocator, slot, .ADSR, "NOTEY", 0, 0, 1);
-    defer allocator.destroy(@as(*ModulePrivateField, @ptrCast(@alignCast(module))));
+    try slot.unlock();
 
     std.debug.print("Module Type: {any}\n", .{module.getModuleType()});
+
+    try slot.lock();
+    module.remove(allocator) catch @panic("Failed To Remove Module");
+    try slot.unlock();
+
+    std.debug.print("Slot type should stay intact: {any}\n", .{slot._info.getSlotId()});
 }
