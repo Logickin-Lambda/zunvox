@@ -4,6 +4,11 @@ const assert = std.debug.assert;
 
 const expectEqual = std.testing.expectEqual;
 
+/// As long as the program encounter a data desync between the sunvox lib and the tracking type,
+/// a panic will be fired because there is no simple way to recover the messed up mapping;
+/// however, this error should only occur when the allocator cause an error which is rare.
+const fatalErrorMsg = "Critical Memory Integrity Error";
+
 // ______________________________________________________________________________________________________________________
 //                                                                                                                      /
 // function table, types and Lookups                                                                                   /
@@ -278,7 +283,7 @@ pub const LoopReleaseFlag = enum(c_int) {
 };
 
 pub const SamplerParamValues = packed union {
-    int: c_int,
+    raw: c_int,
     loop_type: SamplerLoopType,
     loop_release_flag: LoopReleaseFlag,
 };
@@ -365,6 +370,7 @@ const SvError = error{
     FailedToLoadSample,
     SampleParameterNotFound,
     ModuleNotFound,
+    FailedToCountModule,
     FailedToGetModuleFlag,
     FailedToSetModuleName,
     FailedToSetModuleLocation,
@@ -753,14 +759,14 @@ const ProjectFn = struct {
         const result = sv.sv_load(self._info.getSlotId(), @constCast(file_path.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
         self._info.clearModuleList(allocator);
-        self.opacifyExistingModules(allocator) catch @panic("Critial Failure on Mapping Modules");
+        self.opacifyExistingModules(allocator) catch @panic("Critial Memory Integrity Error");
     }
 
     pub fn loadFromMemory(self: Self, allocator: std.mem.Allocator, data: []const u8) SvError!void {
         const result = sv.sv_load(self._info.getSlotId(), @constCast(data.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
         self._info.clearModuleList(allocator);
-        self.opacifyExistingModules(allocator) catch @panic("Critial Failure on Mapping Modules");
+        self.opacifyExistingModules(allocator) catch @panic("Critial Memory Integrity Error");
     }
 
     fn opacifyExistingModules(self: Self, allocator: std.mem.Allocator) !void {
@@ -768,7 +774,7 @@ const ProjectFn = struct {
 
         for (0..@intCast(largest_module_id)) |i| {
             if (sv.sv_get_module_flags(self._info.getSlotId(), @intCast(i)) & 1 == 0) continue;
-            try self._info.registerModule(@intCast(i), try Module.opacify(allocator, self._info, @intCast(i)));
+            try self._info.registerModule(@intCast(i), try Module.opacifyWithID(allocator, self._info, @intCast(i)));
         }
     }
 
@@ -915,28 +921,27 @@ const EventFn = struct {
 };
 
 pub const Module = opaque {
-    /// You SHOULDN'T call this function at all because this is used for the internal library,
-    /// mapping the modules during the project load so that you can process modules at higher levels.
-    /// Although calling the function won't have any effects because modules should be recorded in
-    /// the Slot type once the project has been loaded, It is strongly discouraged to call this
-    /// function because you have wasted time on running module existance and type checks instead
-    /// of doing anything useful.
-    fn opacify(allocator: std.mem.Allocator, slot_info: *SlotInfo, module_id: c_int) !*Module {
-        // Since we have ensured that module slot is not empty, unless there is an update while I haven't update the library,
-        // ModuleType should covers all the possible built-in module type. User modules should only appeared as MetaModule.
-        const module_type_str: []const u8 = std.mem.span(sv.sv_get_module_type(slot_info.getSlotId(), module_id));
-        const module_type = std.meta.stringToEnum(ModuleType, module_type_str);
-        if (module_type == null) return SvError.ModuleNotFound;
-
+    /// turn module id into trackable reference type such that user can access module at high level
+    fn opacify(allocator: std.mem.Allocator, slot_info: *SlotInfo, module_id: c_int, module_type: ModuleType) !*Module {
         var module_field = try allocator.create(ModulePrivateField);
         module_field.module_id = module_id;
-        module_field.module_type = module_type.?;
+        module_field.module_type = module_type;
         module_field.slot_info = slot_info;
 
         const module: *Module = @ptrCast(@alignCast(module_field));
         try slot_info.registerModule(module_id, module);
 
         return module;
+    }
+
+    fn opacifyWithID(allocator: std.mem.Allocator, slot_info: *SlotInfo, module_id: c_int) !*Module {
+        // Since we have ensured that module slot is not empty, unless there is an update while I haven't update the library,
+        // ModuleType should covers all the possible built-in module type. User modules should only appeared as MetaModule.
+        const module_type_str: []const u8 = std.mem.span(sv.sv_get_module_type(slot_info.getSlotId(), module_id));
+        const module_type = std.meta.stringToEnum(ModuleType, module_type_str);
+        if (module_type == null) return SvError.ModuleNotFound;
+
+        return Module.opacify(allocator, slot_info, module_id, module_type.?) catch @panic(fatalErrorMsg);
     }
 
     pub fn new(allocator: std.mem.Allocator, slot: Slot, module_type: ModuleType, name: ?[]const u8, x: i32, y: i32, z_layers: u8) !*Module {
@@ -953,21 +958,43 @@ pub const Module = opaque {
 
         if (result < 0) return SvError.FailedToCreateModule;
 
-        var module_field = try allocator.create(ModulePrivateField);
-        module_field.module_id = result;
-        module_field.module_type = module_type;
-        module_field.slot_info = slot._info;
+        return Module.opacify(allocator, slot._info, result, module_type.?) catch @panic(fatalErrorMsg);
+    }
 
-        const module: *Module = @ptrCast(@alignCast(module_field));
-        try slot._info.registerModule(result, module);
+    pub fn load(allocator: std.mem.Allocator, slot: Slot, module_file_path: []const u8, x: i32, y: i32, z_layers: u8) SvError!*Module {
+        const result = sv.sv_load_module(slot._info.getSlotId(), @ptrCast(module_file_path), x, y, z_layers);
+        if (result < 0) return SvError.FailedToCreateModule;
 
-        return @ptrCast(module);
+        return Module.opacifyWithID(allocator, slot._info, result) catch @panic(fatalErrorMsg);
+    }
+
+    pub fn loadFromMemory(allocator: std.mem.Allocator, slot: Slot, data: []const u8, x: i32, y: i32, z_layers: u8) SvError!*Module {
+        const result = sv.sv_load_module_from_memory(slot._info.getSlotId(), @ptrCast(data.ptr), @intCast(data.len), x, y, z_layers);
+        if (result < 0) return SvError.FailedToCreateModule;
+
+        return Module.opacifyWithID(allocator, slot._info, result) catch @panic(fatalErrorMsg);
     }
 
     pub fn fetchFromSlot(slot: Slot, module_id: u32) ?*Module {
         return slot._info.peekModule(@intCast(module_id));
     }
 
+    pub fn getLargestModuleId(slot: Slot) !u32 {
+        const result = sv.sv_get_number_of_modules(slot._info.getSlotId());
+        if (result < 0) return SvError.FailedToCountModule;
+    }
+
+    pub fn getNumberOfModules(slot: Slot) !u32 {
+        const info: *SlotPrivateField = @ptrCast(@alignCast(slot._info));
+        return info.active_module_list.count();
+    }
+
+    pub fn findModuleByName(slot: Slot, module_name: []u8) ?*Module {
+        const result = sv.sv_find_module(slot._info.isLocked(), @ptrCast(module_name.ptr));
+        if (result >= 0) return slot._info.peekModule(result) else return null;
+    }
+
+    // member functions:
     pub fn remove(self: *Module, allocator: std.mem.Allocator) !void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         if (!info.slot_info.isLocked()) return SvError.LockRequired;
@@ -977,9 +1004,88 @@ pub const Module = opaque {
         allocator.destroy(info);
     }
 
+    pub fn connectModule(self: *Module, target_module: *Module) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const tar_info: *ModulePrivateField = @ptrCast(@alignCast(target_module));
+
+        const result = sv.sv_connect_module(info.slot_info.getSlotId(), info.module_id, tar_info.module_id);
+        if (result < 0) return SvError.FailedToConnectModule;
+    }
+
+    pub fn disconnectModule(self: *Module, target_module: *Module) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const tar_info: *ModulePrivateField = @ptrCast(@alignCast(target_module));
+
+        const result = sv.sv_disconnect_module(info.slot_info.getSlotId(), info.module_id, tar_info.module_id);
+        if (result < 0) return SvError.FailedToDisconnectedModule;
+    }
+
     pub fn getModuleType(self: *Module) ModuleType {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         return info.module_type;
+    }
+
+    pub fn loadSample(self: *Module, sample_file_path: []const u8, sample_slot: u32) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+        const result = sv.sv_sampler_load(info.slot_info.getSlotId(), info.module_id, @ptrCast(sample_file_path.ptr), @intCast(sample_slot));
+
+        if (result < 0) return SvError.FailedToLoadSample;
+    }
+
+    pub fn overrideAllSampleSlots(self: *Module, sample_file_path: []const u8) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+        const result = sv.sv_sampler_load(info.slot_info.getSlotId(), info.module_id, @ptrCast(sample_file_path.ptr), -1);
+
+        if (result < 0) return SvError.FailedToLoadSample;
+    }
+
+    pub fn loadSampleFromMemory(self: *Module, data: []const u8, sample_slot: u32) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+        const result = sv.sv_sampler_load_from_memory(info.slot_info.getSlotId(), info.module_id, @ptrCast(data.ptr), @intCast(data.len), @intCast(sample_slot));
+
+        if (result < 0) return SvError.FailedToLoadSample;
+    }
+
+    pub fn overrideAllSampleSlotsFromMemory(self: *Module, data: []const u8) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+        const result = sv.sv_sampler_load_from_memory(info.slot_info.getSlotId(), info.module_id, @ptrCast(data.ptr), @intCast(data.len), -1);
+
+        if (result < 0) return SvError.FailedToLoadSample;
+    }
+
+    pub fn getSamplerParam(self: *Module, sample_slot: u32, param_type: SamplerProperties) SvError!SamplerParamValues {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+
+        const result = sv.sv_sampler_par(info.slot_info.getSlotId(), info.module_id, @intCast(sample_slot), @intFromEnum(param_type), 0, 0);
+        return SamplerParamValues{ .raw = result };
+    }
+
+    pub fn setSamplerParam(self: *Module, sample_slot: u32, param_type: SamplerProperties, param_val: SamplerParamValues) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+
+        _ = sv.sv_sampler_par(info.slot_info.getSlotId(), info.module_id, @intCast(sample_slot), @intFromEnum(param_type), param_val.raw, 1);
+    }
+
+    pub fn loadProjectToMetaModule(self: *Module, sunvox_file_path: []const u8) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        if (self.getModuleType() != .MetaModule) return SvError.NotMetaModule;
+
+        const result = sv.sv_metamodule_load(info.slot_info.getSlotId(), info.module_id, @ptrCast(sunvox_file_path.ptr));
+        if (result < 0) return SvError.FailedToLoadProject;
+    }
+
+    pub fn loadProjectToMetaModuleFromMemory(self: *Module, data: []const u8) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        if (self.getModuleType() != .MetaModule) return SvError.NotMetaModule;
+
+        const result = sv.sv_metamodule_load_from_memory(info.slot_info.getSlotId(), info.module_id, @ptrCast(data.ptr), @intCast(data.len));
+        if (result < 0) return SvError.FailedToLoadProject;
     }
 };
 
