@@ -209,34 +209,34 @@ const SunVoxFunctionTable = struct {
 // Module Lkup for creating the modules since sunvox passes strings instead of enums or index for module typing
 fn getModuleTypeStr(module_type: ModuleType) []const u8 {
     return switch (module_type) {
-        .Analog_generator => "Analog generator",
+        .@"Analog generator" => "Analog generator",
         .DrumSynth => "DrumSynth",
         .FM => "FM",
         .FMX => "FMX",
         .Generator => "Generator",
         .Input => "Input",
         .Kicker => "Kicker",
-        .Vorbis_player => "Vorbis player",
+        .@"Vorbis player" => "Vorbis player",
         .Sampler => "Sampler",
         .SpectraVoice => "SpectraVoice",
         .Amplifier => "Amplifier",
         .Compressor => "Compressor",
-        .DC_Blocker => "DC_Blocker",
+        .@"DC Blocker" => "DC_Blocker",
         .Delay => "Delay",
         .Distortion => "Distortion",
         .Echo => "Echo",
         .EQ => "EQ",
         .FFT => "FFT",
         .Filter => "Filter",
-        .Filter_Pro => "Filter Pro",
+        .@"Filter Pro" => "Filter Pro",
         .Flanger => "Flanger",
         .LFO => "LFO",
         .Loop => "Loop",
         .Modulator => "Modulator",
-        .Pitch_shifter => "Pitch_shifter",
+        .@"Pitch shifter" => "Pitch_shifter",
         .Reverb => "Reverb",
         .Smooth => "Smooth",
-        .Vocal_filter => "Vocal filter",
+        .@"Vocal filter" => "Vocal filter",
         .Vibrato => "Vibrato",
         .Waveshaper => "Waveshaper",
         .ADSR => "ADSR",
@@ -248,7 +248,7 @@ fn getModuleTypeStr(module_type: ModuleType) []const u8 {
         .MultiCtl => "MultiCtl",
         .MultiSynth => "MultiSynth",
         .Pitch2Ctl => "Pitch2Ctl",
-        .Pitch_Detector => "Pitch_Detector",
+        .@"Pitch Detector" => "Pitch_Detector",
         .Sound2Ctl => "Sound2Ctl",
         .Velocity2Ctl => "Velocity2Ctl",
         .Output => "Output",
@@ -407,19 +407,28 @@ const SlotInfo = opaque {
         private_field.is_locked = false;
     }
 
-    fn register_module(self: *SlotInfo, module: *Module, module_id: c_int) !void {
+    fn registerModule(self: *SlotInfo, module_id: c_int, module: *Module) !void {
         const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
         try private_field.active_module_list.put(module_id, module);
     }
 
-    fn remove_module(self: *SlotInfo, module_id: c_int) bool {
+    fn removeModule(self: *SlotInfo, module_id: c_int) bool {
         const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
         return private_field.active_module_list.remove(module_id);
     }
 
-    fn peek_module(self: *SlotInfo, module_id: c_int) ?*Module {
+    fn peekModule(self: *SlotInfo, module_id: c_int) ?*Module {
         const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
         return private_field.active_module_list.get(module_id);
+    }
+
+    fn clearModuleList(self: *SlotInfo, allocator: std.mem.Allocator) void {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        var iter = private_field.active_module_list.iterator();
+        while (iter.next()) |entry| {
+            allocator.destroy(@as(*ModulePrivateField, @ptrCast(@alignCast(entry.value_ptr.*))));
+            _ = self.removeModule(entry.key_ptr.*);
+        }
     }
 };
 
@@ -461,43 +470,45 @@ pub const Note = extern struct {
     ctl_vel: u16,
 };
 
-/// I understand the naming convention is a bit... not consistent,
+/// I understand the naming convention is a bit... inconsistent,
 /// but since we have used SunVox for a long time or at least long
 /// enough before touching this library, we find some familiarity
 /// with this convention, but this could easily causes typing mistakes;
 /// thus, the ZunVox library will offer you an enum instead so that
 /// the library handles the typing for you when you add a new module.
+/// In addition, this enum set up works the best for mapping the
+/// module type collected from the library.
 pub const ModuleType = enum(u8) {
     // synths
-    Analog_generator = 0,
+    @"Analog generator" = 0,
     DrumSynth,
     FM,
     FMX,
     Generator,
     Input,
     Kicker,
-    Vorbis_player,
+    @"Vorbis player",
     Sampler,
     SpectraVoice,
     // effects
     Amplifier,
     Compressor,
-    DC_Blocker,
+    @"DC Blocker",
     Delay,
     Distortion,
     Echo,
     EQ,
     FFT,
     Filter,
-    Filter_Pro,
+    @"Filter Pro",
     Flanger,
     LFO,
     Loop,
     Modulator,
-    Pitch_shifter,
+    @"Pitch shifter",
     Reverb,
     Smooth,
-    Vocal_filter,
+    @"Vocal filter",
     Vibrato,
     Waveshaper,
     // misc
@@ -510,10 +521,10 @@ pub const ModuleType = enum(u8) {
     MultiCtl,
     MultiSynth,
     Pitch2Ctl,
-    Pitch_Detector,
+    @"Pitch Detector",
     Sound2Ctl,
     Velocity2Ctl,
-    /// NON ASSIGNABLE, Only used for type check
+    /// NON ASSIGNABLE", Only used for type check
     Output,
 };
 
@@ -701,6 +712,7 @@ pub const Slot = struct {
             }
 
             // Clear off the private object, and release the instance_tracker state to inactive
+            self._info.clearModuleList(allocator);
             const slot_info: *SlotPrivateField = @ptrCast(@alignCast(self._info));
             slot_info.active_module_list.deinit();
             allocator.destroy(slot_info);
@@ -737,14 +749,27 @@ const ProjectFn = struct {
     const Self = @This();
     _info: *SlotInfo = undefined,
 
-    pub fn load(self: Self, file_path: []const u8) SvError!void {
+    pub fn load(self: Self, allocator: std.mem.Allocator, file_path: []const u8) SvError!void {
         const result = sv.sv_load(self._info.getSlotId(), @constCast(file_path.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
+        self._info.clearModuleList(allocator);
+        self.opacifyExistingModules(allocator) catch @panic("Critial Failure on Mapping Modules");
     }
 
-    pub fn loadFromMemory(self: Self, data: []const u8) SvError!void {
+    pub fn loadFromMemory(self: Self, allocator: std.mem.Allocator, data: []const u8) SvError!void {
         const result = sv.sv_load(self._info.getSlotId(), @constCast(data.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
+        self._info.clearModuleList(allocator);
+        self.opacifyExistingModules(allocator) catch @panic("Critial Failure on Mapping Modules");
+    }
+
+    fn opacifyExistingModules(self: Self, allocator: std.mem.Allocator) !void {
+        const largest_module_id = sv.sv_get_number_of_modules(self._info.getSlotId());
+
+        for (0..@intCast(largest_module_id)) |i| {
+            if (sv.sv_get_module_flags(self._info.getSlotId(), @intCast(i)) & 1 == 0) continue;
+            try self._info.registerModule(@intCast(i), try Module.opacify(allocator, self._info, @intCast(i)));
+        }
     }
 
     pub fn save(self: Self, file_name: []const u8) SvError!void {
@@ -889,7 +914,7 @@ const EventFn = struct {
     }
 };
 
-const Module = opaque {
+pub const Module = opaque {
     /// You SHOULDN'T call this function at all because this is used for the internal library,
     /// mapping the modules during the project load so that you can process modules at higher levels.
     /// Although calling the function won't have any effects because modules should be recorded in
@@ -899,30 +924,19 @@ const Module = opaque {
     fn opacify(allocator: std.mem.Allocator, slot_info: *SlotInfo, module_id: c_int) !*Module {
         // Since we have ensured that module slot is not empty, unless there is an update while I haven't update the library,
         // ModuleType should covers all the possible built-in module type. User modules should only appeared as MetaModule.
-        const module_type = std.meta.stringToEnum(ModuleType, @ptrCast(sv.sv_get_module_type(slot_info.getSlotId(), module_id)));
+        const module_type_str: []const u8 = std.mem.span(sv.sv_get_module_type(slot_info.getSlotId(), module_id));
+        const module_type = std.meta.stringToEnum(ModuleType, module_type_str);
         if (module_type == null) return SvError.ModuleNotFound;
 
         var module_field = try allocator.create(ModulePrivateField);
         module_field.module_id = module_id;
-        module_field.module_type = module_type;
+        module_field.module_type = module_type.?;
         module_field.slot_info = slot_info;
 
         const module: *Module = @ptrCast(@alignCast(module_field));
-        try slot_info.register_module(module, module_id);
+        try slot_info.registerModule(module_id, module);
 
         return module;
-    }
-
-    /// You SHOULDN'T call this function at all because this is used for the internal library,
-    /// mapping the modules during the project load so that you can process modules at higher levels.
-    /// Although calling the function won't have any effects because modules should be recorded in
-    /// the Slot type once the project has been loaded, It is strongly discouraged to call this
-    /// function because you have wasted time on running module existance and type checks instead
-    /// of doing anything useful
-    fn deopacify(self: *Module, allocator: std.mem.Allocator) void {
-        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
-        _ = info.slot_info.remove_module(info.module_id);
-        allocator.destroy(info);
     }
 
     pub fn new(allocator: std.mem.Allocator, slot: Slot, module_type: ModuleType, name: ?[]const u8, x: i32, y: i32, z_layers: u8) !*Module {
@@ -945,9 +959,13 @@ const Module = opaque {
         module_field.slot_info = slot._info;
 
         const module: *Module = @ptrCast(@alignCast(module_field));
-        try slot._info.register_module(module, result);
+        try slot._info.registerModule(result, module);
 
         return @ptrCast(module);
+    }
+
+    pub fn fetchFromSlot(slot: Slot, module_id: u32) ?*Module {
+        return slot._info.peekModule(@intCast(module_id));
     }
 
     pub fn remove(self: *Module, allocator: std.mem.Allocator) !void {
@@ -955,7 +973,7 @@ const Module = opaque {
         if (!info.slot_info.isLocked()) return SvError.LockRequired;
 
         if (sv.sv_remove_module(info.slot_info.getSlotId(), info.module_id) < 0) return SvError.FailedToRemoveModule;
-        _ = info.slot_info.remove_module(info.module_id);
+        _ = info.slot_info.removeModule(info.module_id);
         allocator.destroy(info);
     }
 
