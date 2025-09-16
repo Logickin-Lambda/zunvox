@@ -319,15 +319,16 @@ pub const Color = packed union {
     },
 };
 
-pub const PitchProperties = packed union {
+pub const DetuneProperties = packed union {
     raw: u32,
     pitch: struct {
-        rel: u16,
-        fine: u16,
+        rel: i16,
+        fine: i16,
     },
 };
 
-pub const MultiSynthCurveType = enum(c_int) {
+pub const CurveType = enum(c_int) {
+    default = -1,
     curve1_note_to_vel = 0,
     curve2_vel_to_vel,
     curve3_note_to_pitch,
@@ -852,7 +853,7 @@ const ProjectFn = struct {
     pub fn getName(self: Self) ?[]const u8 {
         const result = sv.sv_get_song_name(self._info.getSlotId());
         if (result == null) return null;
-        return @ptrCast(result);
+        return std.mem.span(result);
     }
 
     pub fn setName(self: Self, name: []const u8) SvError!void {
@@ -1095,6 +1096,109 @@ pub const Module = opaque {
         const result = sv.sv_get_module_flags(info.slot_info.getSlotId(), info.module_id);
         return ModuleFlags{ .raw = result };
     }
+
+    pub fn getModuleInputs(self: *Module, allocator: std.mem.Allocator) ![]*Module {
+        return self.getModulePorts(allocator, false);
+    }
+
+    pub fn getModuleOutputs(self: *Module, allocator: std.mem.Allocator) ![]*Module {
+        return self.getModulePorts(allocator, true);
+    }
+
+    fn getModulePorts(self: *Module, allocator: std.mem.Allocator, isOutput: bool) ![]*Module {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const port_cnt = if (isOutput) self.getFlags().details.outputs_cnt else self.getFlags().details.inputs_cnt;
+        // if (port_cnt == 0) return null;
+
+        var port_ptr: [*]c_int = undefined;
+        if (isOutput) {
+            port_ptr = @ptrCast(sv.sv_get_module_outputs(info.slot_info.getSlotId(), info.module_id));
+        } else {
+            port_ptr = @ptrCast(sv.sv_get_module_inputs(info.slot_info.getSlotId(), info.module_id));
+        }
+
+        var result = try allocator.alloc(*Module, self.countNumberOfModuleFromPort(port_ptr, port_cnt));
+        var index: usize = 0;
+        for (0..port_cnt) |i| {
+            if (port_ptr[i] < 0) continue;
+            result[index] = info.slot_info.peekModule(port_ptr[i]).?;
+            index += 1;
+        }
+
+        return result;
+    }
+
+    fn countNumberOfModuleFromPort(_: *Module, input_ptr: [*]c_int, input_cnt: u8) usize {
+        var cnt: usize = 0;
+        for (0..input_cnt) |i| {
+            if (input_ptr[i] >= 0) cnt += 1;
+        }
+        return cnt;
+    }
+
+    pub fn getName(self: *Module) ?[]const u8 {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+
+        const result = sv.sv_get_module_name(info.slot_info.getSlotId(), info.module_id);
+        if (result == null) return null;
+        return std.mem.span(result);
+    }
+
+    pub fn setName(self: *Module, module_name: []const u8) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+
+        const result = sv.sv_set_module_name(info.slot_info.getSlotId(), info.module_id, @ptrCast(module_name.ptr));
+        if (result < 0) return SvError.FailedToSetModuleName;
+    }
+
+    pub fn getXY(self: *Module) ModuleLocation {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        return ModuleLocation{ .raw = sv.sv_get_module_xy(info.slot_info.getSlotId(), info.module_id) };
+    }
+
+    pub fn setXY(self: *Module, x: i32, y: i32) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_set_module_xy(info.slot_info.getSlotId(), info.module_id, @intCast(x), @intCast(y));
+        if (result < 0) return SvError.FailedToSetModuleLocation;
+    }
+
+    pub fn getColor(self: *Module) Color {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        return Color{ .raw = sv.sv_get_module_color(info.slot_info.getSlotId(), info.module_id) };
+    }
+
+    pub fn setColor(self: *Module, color: Color) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_set_module_color(info.slot_info.getSlotId(), info.module_id, color.raw);
+        if (result < 0) return SvError.FailedToSetModuleColor;
+    }
+
+    pub fn getDetuneProperties(self: *Module) DetuneProperties {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        return DetuneProperties{ .raw = sv.sv_get_module_finetune(info.slot_info.getSlotId(), info.module_id) };
+    }
+
+    pub fn setRelNote(self: *Module, rel_note: i16) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_set_module_relnote(info.slot_info.getSlotId(), info.module_id, @intCast(rel_note));
+        if (result < 0) return SvError.FailedToSetModuleRelNote;
+    }
+
+    pub fn setFinetune(self: *Module, finetune: i16) SvError!void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_set_module_finetune(info.slot_info.getSlotId(), info.module_id, @intCast(finetune));
+        if (result < 0) return SvError.FailedToSetModuleFinetune;
+    }
+
+    pub fn getScrope(self: *Module, channel: u32, out_buffer: []i16) u32 {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_get_module_scope2(info.slot_info.getSlotId(), info.module_id, @intCast(channel), @constCast(out_buffer.ptr), @intCast(out_buffer.len));
+        return @intCast(result);
+    }
+
+    // pub fn getCurve(self: *Module, curve_type: CurveType, out_buffer: []f32) !void{
+
+    // }
 };
 
 test "init sunvox library; create and destory SunVox Instances" {
@@ -1238,4 +1342,14 @@ test "Module Connection Test" {
     try square.connect(filter);
     try saw.connect(filter);
     try sine.connect(filter);
+
+    const input = try filter.getModuleInputs(allocator);
+    defer allocator.free(input);
+
+    const output = try filter.getModuleOutputs(allocator);
+    defer allocator.free(output);
+
+    std.debug.print("the input module of Filter: {any}\n", .{input});
+    std.debug.print("the output module of Filter: {any}\n", .{output});
+    std.debug.print("name of this module: {s}", .{square.getName().?});
 }
