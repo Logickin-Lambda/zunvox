@@ -290,15 +290,15 @@ pub const SamplerParamValues = packed union {
 
 pub const ModuleFlags = packed union {
     raw: u32,
-    flags: packed struct {
+    details: packed struct {
         is_exist: bool,
         is_generator: bool,
         is_effect: bool,
         is_muted: bool,
         is_bypassed: bool,
         _padding: u11,
-        inputs_mask: u8,
-        outputs_mask: u8,
+        inputs_cnt: u8,
+        outputs_cnt: u8,
     },
 };
 
@@ -443,6 +443,8 @@ const ModulePrivateField = struct {
     slot_info: *SlotInfo = undefined,
     module_id: c_int,
     module_type: ModuleType,
+    module_inputs: std.AutoHashMap(c_int, *Module),
+    module_outputs: std.AutoHashMap(c_int, *Module),
 };
 
 const ModuleInfo = opaque {};
@@ -774,7 +776,8 @@ const ProjectFn = struct {
 
         for (0..@intCast(largest_module_id)) |i| {
             if (sv.sv_get_module_flags(self._info.getSlotId(), @intCast(i)) & 1 == 0) continue;
-            try self._info.registerModule(@intCast(i), try Module.opacifyWithID(allocator, self._info, @intCast(i)));
+            const module = try Module.opacifyWithID(allocator, self._info, @intCast(i));
+            try self._info.registerModule(@intCast(i), module);
         }
     }
 
@@ -958,7 +961,7 @@ pub const Module = opaque {
 
         if (result < 0) return SvError.FailedToCreateModule;
 
-        return Module.opacify(allocator, slot._info, result, module_type.?) catch @panic(fatalErrorMsg);
+        return Module.opacify(allocator, slot._info, result, module_type) catch @panic(fatalErrorMsg);
     }
 
     pub fn load(allocator: std.mem.Allocator, slot: Slot, module_file_path: []const u8, x: i32, y: i32, z_layers: u8) SvError!*Module {
@@ -994,7 +997,6 @@ pub const Module = opaque {
         if (result >= 0) return slot._info.peekModule(result) else return null;
     }
 
-    // member functions:
     pub fn remove(self: *Module, allocator: std.mem.Allocator) !void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         if (!info.slot_info.isLocked()) return SvError.LockRequired;
@@ -1004,7 +1006,7 @@ pub const Module = opaque {
         allocator.destroy(info);
     }
 
-    pub fn connectModule(self: *Module, target_module: *Module) SvError!void {
+    pub fn connect(self: *Module, target_module: *Module) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         const tar_info: *ModulePrivateField = @ptrCast(@alignCast(target_module));
 
@@ -1012,7 +1014,7 @@ pub const Module = opaque {
         if (result < 0) return SvError.FailedToConnectModule;
     }
 
-    pub fn disconnectModule(self: *Module, target_module: *Module) SvError!void {
+    pub fn disconnect(self: *Module, target_module: *Module) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         const tar_info: *ModulePrivateField = @ptrCast(@alignCast(target_module));
 
@@ -1020,14 +1022,14 @@ pub const Module = opaque {
         if (result < 0) return SvError.FailedToDisconnectedModule;
     }
 
-    pub fn getModuleType(self: *Module) ModuleType {
+    pub fn getType(self: *Module) ModuleType {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         return info.module_type;
     }
 
     pub fn loadSample(self: *Module, sample_file_path: []const u8, sample_slot: u32) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
-        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+        if (self.getType() != .Sampler) return SvError.NotSampler;
         const result = sv.sv_sampler_load(info.slot_info.getSlotId(), info.module_id, @ptrCast(sample_file_path.ptr), @intCast(sample_slot));
 
         if (result < 0) return SvError.FailedToLoadSample;
@@ -1035,7 +1037,7 @@ pub const Module = opaque {
 
     pub fn overrideAllSampleSlots(self: *Module, sample_file_path: []const u8) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
-        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+        if (self.getType() != .Sampler) return SvError.NotSampler;
         const result = sv.sv_sampler_load(info.slot_info.getSlotId(), info.module_id, @ptrCast(sample_file_path.ptr), -1);
 
         if (result < 0) return SvError.FailedToLoadSample;
@@ -1043,7 +1045,7 @@ pub const Module = opaque {
 
     pub fn loadSampleFromMemory(self: *Module, data: []const u8, sample_slot: u32) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
-        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+        if (self.getType() != .Sampler) return SvError.NotSampler;
         const result = sv.sv_sampler_load_from_memory(info.slot_info.getSlotId(), info.module_id, @ptrCast(data.ptr), @intCast(data.len), @intCast(sample_slot));
 
         if (result < 0) return SvError.FailedToLoadSample;
@@ -1051,7 +1053,7 @@ pub const Module = opaque {
 
     pub fn overrideAllSampleSlotsFromMemory(self: *Module, data: []const u8) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
-        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+        if (self.getType() != .Sampler) return SvError.NotSampler;
         const result = sv.sv_sampler_load_from_memory(info.slot_info.getSlotId(), info.module_id, @ptrCast(data.ptr), @intCast(data.len), -1);
 
         if (result < 0) return SvError.FailedToLoadSample;
@@ -1059,7 +1061,7 @@ pub const Module = opaque {
 
     pub fn getSamplerParam(self: *Module, sample_slot: u32, param_type: SamplerProperties) SvError!SamplerParamValues {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
-        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+        if (self.getType() != .Sampler) return SvError.NotSampler;
 
         const result = sv.sv_sampler_par(info.slot_info.getSlotId(), info.module_id, @intCast(sample_slot), @intFromEnum(param_type), 0, 0);
         return SamplerParamValues{ .raw = result };
@@ -1067,14 +1069,14 @@ pub const Module = opaque {
 
     pub fn setSamplerParam(self: *Module, sample_slot: u32, param_type: SamplerProperties, param_val: SamplerParamValues) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
-        if (self.getModuleType() != .Sampler) return SvError.NotSampler;
+        if (self.getType() != .Sampler) return SvError.NotSampler;
 
         _ = sv.sv_sampler_par(info.slot_info.getSlotId(), info.module_id, @intCast(sample_slot), @intFromEnum(param_type), param_val.raw, 1);
     }
 
     pub fn loadProjectToMetaModule(self: *Module, sunvox_file_path: []const u8) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
-        if (self.getModuleType() != .MetaModule) return SvError.NotMetaModule;
+        if (self.getType() != .MetaModule) return SvError.NotMetaModule;
 
         const result = sv.sv_metamodule_load(info.slot_info.getSlotId(), info.module_id, @ptrCast(sunvox_file_path.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
@@ -1082,10 +1084,16 @@ pub const Module = opaque {
 
     pub fn loadProjectToMetaModuleFromMemory(self: *Module, data: []const u8) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
-        if (self.getModuleType() != .MetaModule) return SvError.NotMetaModule;
+        if (self.getType() != .MetaModule) return SvError.NotMetaModule;
 
         const result = sv.sv_metamodule_load_from_memory(info.slot_info.getSlotId(), info.module_id, @ptrCast(data.ptr), @intCast(data.len));
         if (result < 0) return SvError.FailedToLoadProject;
+    }
+
+    pub fn getFlags(self: *Module) ModuleFlags {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_get_module_flags(info.slot_info.getSlotId(), info.module_id);
+        return ModuleFlags{ .raw = result };
     }
 };
 
@@ -1198,11 +1206,36 @@ test "Module Creation Test" {
     const module = try Module.new(allocator, slot, .ADSR, "NOTEY", 0, 0, 1);
     try slot.unlock();
 
-    std.debug.print("Module Type: {any}\n", .{module.getModuleType()});
+    std.debug.print("Module Type: {any}\n", .{module.getType()});
 
     try slot.lock();
     module.remove(allocator) catch @panic("Failed To Remove Module");
     try slot.unlock();
 
     std.debug.print("Slot type should stay intact: {any}\n", .{slot._info.getSlotId()});
+}
+
+test "Module Connection Test" {
+    _ = try init(null, 44100, 2, 0);
+    defer deinit();
+
+    const allocator = std.testing.allocator;
+    var slot = try Slot.create(allocator);
+    defer slot.destroy(allocator) catch {};
+
+    try slot.lock();
+
+    const multi = try Module.new(allocator, slot, .MultiSynth, ">> Input", 0, 0, 1);
+    const square = try Module.new(allocator, slot, .@"Analog generator", "Square", 96, 0, 1);
+    const saw = try Module.new(allocator, slot, .@"Analog generator", "Saw", 96, 96, 1);
+    const sine = try Module.new(allocator, slot, .@"Analog generator", "Sine", 96, 96 * 2, 1);
+    const filter = try Module.new(allocator, slot, .@"Filter Pro", null, 96 * 2, 0, 1);
+
+    try multi.connect(square);
+    try multi.connect(saw);
+    try multi.connect(sine);
+
+    try square.connect(filter);
+    try saw.connect(filter);
+    try sine.connect(filter);
 }
