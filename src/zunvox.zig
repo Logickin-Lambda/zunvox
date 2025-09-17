@@ -333,6 +333,12 @@ pub const CurveType = enum(c_int) {
     curve3_note_to_pitch,
 };
 
+pub const ControlScale = enum(c_int) {
+    raw = 0,
+    xxyy_map,
+    display,
+};
+
 // Here are the list of errors for the library, to replace the negative value used for the original library
 // so that to provide a clearer ideas of what goes wrong with your projects
 const SvError = error{
@@ -380,6 +386,8 @@ const SvError = error{
     FailedToAccessModuleCurve,
     ModuleNotSupported,
     WrongBufferLength,
+    FailedToAccessControlInformation,
+    FailedToUpdateModuleCurve,
 };
 
 /// The original library requires the user to specify the sunvox instance ID (aka slot_id)
@@ -935,6 +943,7 @@ const EventFn = struct {
     }
 };
 
+const VISUAL_CONTROL_OFFSET = 1;
 pub const Module = opaque {
     /// turn module id into trackable reference type such that user can access module at high level
     fn opacify(slot_info: *SlotInfo, module_id: c_int, module_type: ModuleType) !*Module {
@@ -1256,9 +1265,61 @@ pub const Module = opaque {
             else => return SvError.ModuleNotSupported,
         }
 
-        const curve_id: c_int = if (info.module_type != .MultiSynth) 0 else if (curve_type == null) 0 else @intCast(@intFromEnum(curve_type.?));
+        const curve_id: c_int = if (info.module_type != .MultiSynth) 0 else if (curve_type == null) 0 else @intFromEnum(curve_type.?);
         const result = sv.sv_module_curve(info.slot_info.getSlotId(), info.module_id, curve_id, @ptrCast(curve_data.ptr), @intCast(curve_data.len), 1);
         if (result < 0) return SvError.FailedToAccessModuleCurve;
+    }
+
+    pub fn getControlCount(self: *Module) SvError!u32 {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_get_number_of_module_ctls(info.slot_info.getSlotId(), info.module_id);
+        if (result < 0) return SvError.FailedToAccessControlInformation;
+        return @intCast(result);
+    }
+
+    pub fn getControlName(self: *Module, control_id: usize) SvError!?[]u8 {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_get_module_ctl_name(info.slot_info.getSlotId(), info.module_id, @intCast(control_id - VISUAL_CONTROL_OFFSET));
+        if (result == null) return null;
+        return std.mem.span(result);
+    }
+
+    pub fn getControlValue(self: *Module, control_id: usize, scale: ControlScale) i32 {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_get_module_ctl_value(info.slot_info.getSlotId(), info.module_id, @intCast(control_id - VISUAL_CONTROL_OFFSET), @intFromEnum(scale));
+        return @intCast(result);
+    }
+
+    /// This function is known to be processed asynchronously in the original library,
+    /// please ensure you have properly tracked the control value being updated before
+    /// saving the project or the change will be lost
+    pub fn setControlValueAsync(self: *Module, control_id: usize, control_val: i32, scale: ControlScale) !void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_set_module_ctl_value(info.slot_info.getSlotId(), info.module_id, @intCast(control_id - VISUAL_CONTROL_OFFSET), @intCast(control_val), @intFromEnum(scale));
+        if (result < 0) return SvError.FailedToUpdateModuleCurve;
+    }
+
+    pub fn getMinControlValue(self: *Module, control_id: usize, scale: ControlScale) i32 {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_get_module_ctl_min(info.slot_info.getSlotId(), info.module_id, @intCast(control_id - VISUAL_CONTROL_OFFSET), @intFromEnum(scale));
+        return @intCast(result);
+    }
+
+    pub fn getMaxControlValue(self: *Module, control_id: usize, scale: ControlScale) i32 {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_get_module_ctl_max(info.slot_info.getSlotId(), info.module_id, @intCast(control_id - VISUAL_CONTROL_OFFSET), @intFromEnum(scale));
+        return @intCast(result);
+    }
+
+    /// Control group is the color code of the control in modules; taking analog generator as an example,
+    /// Volume, Waveform and panning has the same control color aligned to your gui color theme, thus group 0,
+    /// The following four control are colored in red, which is group 1, and so on. In other words, if you
+    /// have worked on building MetaModule with defining the color of the control, they are basically
+    /// @1 @2 @3... prepended from the controller name.
+    pub fn getControlGroup(self: *Module, control_id: usize) i32 {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_get_module_ctl_group(info.slot_info.getSlotId(), info.module_id, @intCast(control_id - VISUAL_CONTROL_OFFSET));
+        return @intCast(result);
     }
 };
 
@@ -1431,8 +1492,8 @@ test "Module Curve Test" {
     defer slot.destroy() catch {};
 
     try slot.lock();
-
     const drawn = try Module.new(slot, .@"Analog generator", "drawn wave test", 0, 0, 1);
+    try slot.unlock();
 
     var curve = try drawn.getCurve(allocator, null);
     defer allocator.free(curve);
@@ -1450,4 +1511,48 @@ test "Module Curve Test" {
         // floating point error, so I let the function pass if the overall contour is same
         try std.testing.expect(@abs(elements - elements_new) < 0.01);
     }
+}
+
+test "Module Control Test" {
+    _ = try init(null, 44100, 2, 0);
+    defer deinit();
+
+    const allocator = std.testing.allocator;
+    var slot = try Slot.create(allocator);
+    defer slot.destroy() catch {};
+
+    try slot.lock();
+    const drawn = try Module.new(slot, .@"Analog generator", "drawn wave test", 0, 0, 1);
+    try slot.unlock();
+
+    const control_cnt = try drawn.getControlCount();
+    try expectEqual(22, control_cnt);
+
+    const control_name = try drawn.getControlName(0xA);
+    try std.testing.expect(std.mem.eql(u8, "Filter", control_name.?));
+
+    const panning_display = drawn.getControlValue(3, .display);
+    const panning_xxyy = drawn.getControlValue(3, .xxyy_map);
+    const panning_raw = drawn.getControlValue(3, .raw);
+    try expectEqual(0, panning_display);
+    try expectEqual(0x4000, panning_xxyy);
+    try expectEqual(128, panning_raw);
+
+    try drawn.setControlValueAsync(3, 64, .display);
+
+    std.Thread.sleep(1e9);
+
+    const panning_display_new = drawn.getControlValue(3, .display);
+    const panning_xxyy_new = drawn.getControlValue(3, .xxyy_map);
+    const panning_raw_new = drawn.getControlValue(3, .raw);
+
+    try expectEqual(64, panning_display_new);
+    try expectEqual(0x6000, panning_xxyy_new);
+    try expectEqual(192, panning_raw_new);
+
+    const panning_min = drawn.getMinControlValue(3, .display);
+    const panning_max = drawn.getMaxControlValue(3, .display);
+
+    try expectEqual(-128, panning_min);
+    try expectEqual(128, panning_max);
 }
