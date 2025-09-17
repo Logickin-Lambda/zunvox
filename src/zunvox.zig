@@ -328,7 +328,6 @@ pub const DetuneProperties = packed union {
 };
 
 pub const CurveType = enum(c_int) {
-    default = -1,
     curve1_note_to_vel = 0,
     curve2_vel_to_vel,
     curve3_note_to_pitch,
@@ -379,6 +378,8 @@ const SvError = error{
     FailedToSetModuleRelNote,
     FailedToSetModuleFinetune,
     FailedToAccessModuleCurve,
+    ModuleNotSupported,
+    WrongBufferLength,
 };
 
 /// The original library requires the user to specify the sunvox instance ID (aka slot_id)
@@ -444,8 +445,6 @@ const ModulePrivateField = struct {
     slot_info: *SlotInfo = undefined,
     module_id: c_int,
     module_type: ModuleType,
-    module_inputs: std.AutoHashMap(c_int, *Module),
-    module_outputs: std.AutoHashMap(c_int, *Module),
 };
 
 const ModuleInfo = opaque {};
@@ -700,6 +699,9 @@ pub const Slot = struct {
 
                 var slot = Self{};
                 slot.setupSlot(@ptrCast(private_field));
+
+                const output = try Module.opacifyWithID(allocator, slot._info, 0);
+                try private_field.active_module_list.put(0, output);
 
                 return slot;
             }
@@ -1196,9 +1198,59 @@ pub const Module = opaque {
         return @intCast(result);
     }
 
-    // pub fn getCurve(self: *Module, curve_type: CurveType, out_buffer: []f32) !void{
+    pub fn getCurve(self: *Module, allocator: std.mem.Allocator, curve_type: ?CurveType) ![]f32 {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        var buffer: []f32 = undefined;
 
-    // }
+        switch (info.module_type) {
+            .MultiSynth => {
+                const auto_curve_type = if (curve_type) |ct| ct else CurveType.curve1_note_to_vel;
+                switch (auto_curve_type) {
+                    .curve1_note_to_vel => buffer = try allocator.alloc(f32, 128),
+                    .curve2_vel_to_vel => buffer = try allocator.alloc(f32, 257),
+                    .curve3_note_to_pitch => buffer = try allocator.alloc(f32, 128),
+                }
+            },
+            .Waveshaper => buffer = try allocator.alloc(f32, 256),
+            .MultiCtl => buffer = try allocator.alloc(f32, 257),
+            .@"Analog generator" => buffer = try allocator.alloc(f32, 32),
+            .FMX => buffer = try allocator.alloc(f32, 256),
+            else => return SvError.ModuleNotSupported,
+        }
+
+        const curve_id: c_int = if (info.module_type != .MultiSynth) 0 else if (curve_type == null) 0 else @intCast(@intFromEnum(curve_type.?));
+        const result = sv.sv_module_curve(info.slot_info.getSlotId(), info.module_id, curve_id, @ptrCast(buffer.ptr), @intCast(buffer.len), 0);
+        if (result < 0) {
+            allocator.free(buffer);
+            return SvError.FailedToAccessModuleCurve;
+        } else {
+            return buffer;
+        }
+    }
+
+    pub fn setCurve(self: *Module, curve_type: ?CurveType, curve_data: []f32) !void {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+
+        switch (info.module_type) {
+            .MultiSynth => {
+                const auto_curve_type = if (curve_type) |ct| ct else CurveType.curve1_note_to_vel;
+                switch (auto_curve_type) {
+                    .curve1_note_to_vel => if (curve_data.len != 128) return SvError.WrongBufferLength,
+                    .curve2_vel_to_vel => if (curve_data.len != 257) return SvError.WrongBufferLength,
+                    .curve3_note_to_pitch => if (curve_data.len != 128) return SvError.WrongBufferLength,
+                }
+            },
+            .Waveshaper => if (curve_data.len != 256) return SvError.WrongBufferLength,
+            .MultiCtl => if (curve_data.len != 257) return SvError.WrongBufferLength,
+            .@"Analog generator" => if (curve_data.len != 32) return SvError.WrongBufferLength,
+            .FMX => if (curve_data.len != 256) return SvError.WrongBufferLength,
+            else => return SvError.ModuleNotSupported,
+        }
+
+        const curve_id: c_int = if (info.module_type != .MultiSynth) 0 else if (curve_type == null) 0 else @intCast(@intFromEnum(curve_type.?));
+        const result = sv.sv_module_curve(info.slot_info.getSlotId(), info.module_id, curve_id, @ptrCast(curve_data.ptr), @intCast(curve_data.len), 1);
+        if (result < 0) return SvError.FailedToAccessModuleCurve;
+    }
 };
 
 test "init sunvox library; create and destory SunVox Instances" {
@@ -1310,13 +1362,13 @@ test "Module Creation Test" {
     const module = try Module.new(allocator, slot, .ADSR, "NOTEY", 0, 0, 1);
     try slot.unlock();
 
-    std.debug.print("Module Type: {any}\n", .{module.getType()});
+    try expectEqual(ModuleType.ADSR, module.getType());
 
     try slot.lock();
     module.remove(allocator) catch @panic("Failed To Remove Module");
     try slot.unlock();
 
-    std.debug.print("Slot type should stay intact: {any}\n", .{slot._info.getSlotId()});
+    try expectEqual(0, slot._info.getSlotId());
 }
 
 test "Module Connection Test" {
@@ -1334,6 +1386,7 @@ test "Module Connection Test" {
     const saw = try Module.new(allocator, slot, .@"Analog generator", "Saw", 96, 96, 1);
     const sine = try Module.new(allocator, slot, .@"Analog generator", "Sine", 96, 96 * 2, 1);
     const filter = try Module.new(allocator, slot, .@"Filter Pro", null, 96 * 2, 0, 1);
+    const output = Module.fetchFromSlot(slot, 0).?;
 
     try multi.connect(square);
     try multi.connect(saw);
@@ -1343,13 +1396,49 @@ test "Module Connection Test" {
     try saw.connect(filter);
     try sine.connect(filter);
 
-    const input = try filter.getModuleInputs(allocator);
-    defer allocator.free(input);
+    try filter.connect(output);
 
-    const output = try filter.getModuleOutputs(allocator);
-    defer allocator.free(output);
+    const input_mods = try filter.getModuleInputs(allocator);
+    defer allocator.free(input_mods);
 
-    std.debug.print("the input module of Filter: {any}\n", .{input});
-    std.debug.print("the output module of Filter: {any}\n", .{output});
-    std.debug.print("name of this module: {s}", .{square.getName().?});
+    const output_mods = try filter.getModuleOutputs(allocator);
+    defer allocator.free(output_mods);
+
+    const target_result = [_]*Module{ square, saw, sine };
+    for (input_mods, 0..) |module, i| {
+        try expectEqual(target_result[i], module);
+    }
+    try expectEqual(1, output_mods.len);
+    try expectEqual(output, output_mods[0]);
+    try std.testing.expect(std.mem.eql(u8, "Square", square.getName().?));
+}
+
+test "Module Curve Test" {
+    _ = try init(null, 44100, 2, 0);
+    defer deinit();
+
+    const allocator = std.testing.allocator;
+    var slot = try Slot.create(allocator);
+    defer slot.destroy(allocator) catch {};
+
+    try slot.lock();
+
+    const drawn = try Module.new(allocator, slot, .@"Analog generator", "drawn wave test", 0, 0, 1);
+
+    var curve = try drawn.getCurve(allocator, null);
+    defer allocator.free(curve);
+
+    for (0..curve.len) |i| {
+        curve[i] = @sin(@as(f32, @floatFromInt(i)) / 16.0 * std.math.pi);
+    }
+
+    try drawn.setCurve(null, curve);
+
+    const curve_new = try drawn.getCurve(allocator, null);
+    defer allocator.free(curve_new);
+
+    for (curve, curve_new) |elements, elements_new| {
+        // floating point error, so I let the function pass if the overall contour is same
+        try std.testing.expect(@abs(elements - elements_new) < 0.01);
+    }
 }
