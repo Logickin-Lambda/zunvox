@@ -388,6 +388,14 @@ const SvError = error{
     WrongBufferLength,
     FailedToAccessControlInformation,
     FailedToUpdateModuleCurve,
+    FailedToCreatePattern,
+    FailedToRemovePattern,
+    FailedToCountPattern,
+    FailedToSetPatternLocation,
+    FailedToCountTracks,
+    FailedToCountLines,
+    FailedToSetPatternSize,
+    FailedToSetPatternName,
 };
 
 /// The original library requires the user to specify the sunvox instance ID (aka slot_id)
@@ -397,6 +405,7 @@ const SlotPrivateField = struct {
     slot_id: c_int, // The original library capped the number of slots at 16
     is_locked: bool = false,
     active_module_list: std.AutoHashMap(c_int, *Module),
+    active_pattern_list: std.AutoHashMap(c_int, *Pattern),
     allocator: std.mem.Allocator,
 };
 
@@ -448,17 +457,45 @@ const SlotInfo = opaque {
         }
     }
 
+    fn registerPattern(self: *SlotInfo, pattern_id: c_int, pattern: *Pattern) !void {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        try private_field.active_pattern_list.put(pattern_id, pattern);
+    }
+
+    fn removePattern(self: *SlotInfo, pattern_id: c_int) bool {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        return private_field.active_pattern_list.remove(pattern_id);
+    }
+
+    fn peekPattern(self: *SlotInfo, pattern_id: c_int) ?*Pattern {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        return private_field.active_pattern_list.get(pattern_id);
+    }
+
+    fn clearPatternList(self: *SlotInfo) void {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        var iter = private_field.active_pattern_list.iterator();
+        while (iter.next()) |entry| {
+            self.getAllocator().destroy(@as(*PatternPrivateField, @ptrCast(@alignCast(entry.value_ptr.*))));
+            _ = self.removePattern(entry.key_ptr.*);
+        }
+    }
+
     fn getAllocator(self: *SlotInfo) std.mem.Allocator {
         const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
         return private_field.allocator;
     }
 };
 
-/// The objective of this library is to hide all the manual index for most of the functions,
 const ModulePrivateField = struct {
     slot_info: *SlotInfo = undefined,
     module_id: c_int,
     module_type: ModuleType,
+};
+
+const PatternPrivateField = struct {
+    slot_info: *SlotInfo = undefined,
+    pattern_id: c_int,
 };
 
 const ModuleInfo = opaque {};
@@ -483,13 +520,12 @@ var slot_state_list = std.mem.zeroes([16]bool);
 //
 // The following code are available from the user perspective, offering a more idiomatic experience to use the SunVox Lib:
 //
-/// To be defined
 pub const Note = extern struct {
     note: u8,
     vel: u8,
     module: u16,
-    ctl: u16,
-    ctl_vel: u16,
+    ccee: u16,
+    xxyy: u16,
 };
 
 /// I understand the naming convention is a bit... inconsistent,
@@ -710,6 +746,7 @@ pub const Slot = struct {
                 var private_field = try allocator.create(SlotPrivateField);
                 private_field.slot_id = @intCast(i);
                 private_field.active_module_list = std.AutoHashMap(c_int, *Module).init(allocator);
+                private_field.active_pattern_list = std.AutoHashMap(c_int, *Pattern).init(allocator);
                 private_field.allocator = allocator;
 
                 var slot = Self{};
@@ -718,6 +755,9 @@ pub const Slot = struct {
                 // set up module for empty project
                 const output = try Module.opacifyWithID(slot._info, 0);
                 try private_field.active_module_list.put(0, output);
+
+                const initial_pattern = try Pattern.opacify(slot._info, 0);
+                try private_field.active_pattern_list.put(0, initial_pattern);
 
                 return slot;
             }
@@ -742,7 +782,9 @@ pub const Slot = struct {
             const slot_info: *SlotPrivateField = @ptrCast(@alignCast(self._info));
             const allocator = slot_info.allocator;
             self._info.clearModuleList();
+            self._info.clearPatternList();
             slot_info.active_module_list.deinit();
+            slot_info.active_pattern_list.deinit();
             allocator.destroy(slot_info);
             slot_state_list[@intCast(slot_id)] = false;
         } else {
@@ -781,14 +823,18 @@ const ProjectFn = struct {
         const result = sv.sv_load(self._info.getSlotId(), @constCast(file_path.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
         self._info.clearModuleList();
+        self._info.clearPatternList();
         self.opacifyExistingModules() catch @panic("Critial Memory Integrity Error");
+        self.opacifyExistingPatterns() catch @panic("Critial Memory Integrity Error");
     }
 
     pub fn loadFromMemory(self: Self, data: []const u8) SvError!void {
         const result = sv.sv_load(self._info.getSlotId(), @constCast(data.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
         self._info.clearModuleList();
+        self._info.clearPatternList();
         self.opacifyExistingModules() catch @panic("Critial Memory Integrity Error");
+        self.opacifyExistingPatterns() catch @panic("Critial Memory Integrity Error");
     }
 
     fn opacifyExistingModules(self: Self) !void {
@@ -798,6 +844,17 @@ const ProjectFn = struct {
             if (sv.sv_get_module_flags(self._info.getSlotId(), @intCast(i)) & 1 == 0) continue;
             const module = try Module.opacifyWithID(self._info, @intCast(i));
             try self._info.registerModule(@intCast(i), module);
+        }
+    }
+
+    fn opacifyExistingPatterns(self: Self) !void {
+        const largest_pattern_id = sv.sv_get_number_of_patterns(self._info.getSlotId());
+
+        for (0..@intCast(largest_pattern_id)) |i| {
+            // the negative error code never happens, but we can know the slot is empty if the pattern lines are 0
+            if (sv.sv_get_pattern_lines(self._info.getSlotId(), @intCast(i)) == 0) continue;
+            const pattern = try Pattern.opacify(self._info, @intCast(i));
+            try self._info.registerPattern(@intCast(i), pattern);
         }
     }
 
@@ -1003,7 +1060,7 @@ pub const Module = opaque {
         return slot._info.peekModule(@intCast(module_id));
     }
 
-    pub fn getLargestModuleId(slot: Slot) !u32 {
+    pub fn getLargestModuleID(slot: Slot) !u32 {
         const result = sv.sv_get_number_of_modules(slot._info.getSlotId());
         if (result < 0) return SvError.FailedToCountModule;
     }
@@ -1014,7 +1071,7 @@ pub const Module = opaque {
     }
 
     pub fn findModuleByName(slot: Slot, module_name: []u8) ?*Module {
-        const result = sv.sv_find_module(slot._info.isLocked(), @ptrCast(module_name.ptr));
+        const result = sv.sv_find_module(slot._info.getSlotId(), @ptrCast(module_name.ptr));
         if (result >= 0) return slot._info.peekModule(result) else return null;
     }
 
@@ -1323,6 +1380,134 @@ pub const Module = opaque {
     }
 };
 
+pub const Pattern = opaque {
+    pub fn opacify(slot_info: *SlotInfo, pattern_id: c_int) !*Pattern {
+        var pattern_field = try slot_info.getAllocator().create(PatternPrivateField);
+        pattern_field.pattern_id = pattern_id;
+        pattern_field.slot_info = slot_info;
+
+        const pattern: *Pattern = @ptrCast(@alignCast(pattern_field));
+        try slot_info.registerPattern(pattern_id, pattern);
+
+        return pattern;
+    }
+
+    pub fn new(slot: Slot, clone: ?*Pattern, x: i32, y: i32, track_cnt: u32, line_cnt: u32, icon_seed: ?i32, pattern_name: ?[]u32) !*Pattern {
+        if (!slot._info.isLocked()) return SvError.LockRequired;
+
+        const auto_icon_seed: c_int = if (icon_seed) |isd| @intCast(isd) else std.crypto.random.int(c_int);
+        const result = sv.sv_new_pattern(
+            slot._info.getSlotId(),
+            if (clone) |cln| @intCast(cln) else -1,
+            @intCast(x),
+            @intCast(y),
+            @intCast(track_cnt),
+            @intCast(line_cnt),
+            auto_icon_seed,
+            pattern_name,
+        );
+
+        if (result < 0) return SvError.FailedToCreatePattern;
+        return Pattern.opacify(slot._info, result);
+    }
+
+    pub fn fetchFromSlotByID(slot: Slot, pattern_id: u32) ?*Pattern {
+        return slot._info.peekPattern(@intCast(pattern_id));
+    }
+
+    pub fn getLargestPatternID(slot: Slot) !u32 {
+        const result = sv.sv_get_number_of_patterns(slot._info.getSlotId());
+        if (result < 0) SvError.FailedToCountPattern;
+    }
+
+    pub fn countNumberOfPatterns(slot: Slot) !u32 {
+        const info: *SlotPrivateField = @ptrCast(@alignCast(slot._info));
+        return info.active_pattern_list.count();
+    }
+
+    pub fn findPatternByName(slot: Slot, pattern_name: []u8) ?*Pattern {
+        const result = sv.sv_find_pattern(slot._info.getSlotId(), @ptrCast(pattern_name.ptr));
+        if (result >= 0) return slot._info.peekPattern(result) else return null;
+    }
+
+    // Member functions
+    pub fn remove(self: *Pattern) !void {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        if (!info._info.isLocked()) return SvError.LockRequired;
+
+        if (sv.sv_remove_pattern(info.slot_info.getSlotId(), info.pattern_id) < 0) return SvError.FailedToRemovePattern;
+        _ = info.slot_info.removePattern(info.pattern_id);
+        info.slot_info.getAllocator().destroy(info);
+    }
+
+    pub fn getX(self: *Pattern) !void {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        return sv.sv_get_pattern_x(info.slot_info.getSlotId(), info.pattern_id);
+    }
+
+    pub fn getY(self: *Pattern) !void {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        return sv.sv_get_pattern_y(info.slot_info.getSlotId(), info.pattern_id);
+    }
+
+    pub fn setXY(self: *Pattern, x: i32, y: i32) SvError!void {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_set_pattern_xy(info.slot_info.getSlotId(), info.pattern_id, @intCast(x), @intCast(y));
+        if (result < 0) return SvError.FailedToSetPatternLocation;
+    }
+
+    pub fn getAllocatedTrackCount(self: *Pattern) SvError!usize {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_get_pattern_tracks(info.slot_info.getSlotId(), info.pattern_id);
+        if (result < 0) return SvError.FailedToCountTracks else return @intCast(result);
+    }
+
+    pub fn getAllocatedLineCount(self: *Pattern) SvError!usize {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_get_pattern_lines(info.slot_info.getSlotId(), info.pattern_id);
+        if (result < 0) return SvError.FailedToCountLines else return @intCast(result);
+    }
+
+    /// use null to track_cnt or line_cnt if you want to retain either one of the dimensions
+    pub fn setTrackAndLineCount(self: *Pattern, track_cnt: ?usize, line_cnt: ?usize) SvError!void {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        if (!info.slot_info.isLocked()) return SvError.LockRequired;
+
+        const result = sv.sv_set_pattern_size(
+            info.slot_info.getSlotId(),
+            info.pattern_id,
+            if (track_cnt == null) -1 else @intCast(track_cnt.?),
+            if (line_cnt == null) -1 else @intCast(line_cnt.?),
+        );
+        if (result < 0) return SvError.FailedToSetPatternSize;
+    }
+
+    pub fn getName(self: *Pattern) ?[]const u8 {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+
+        const result = sv.sv_get_pattern_name(info.slot_info.getSlotId(), info.pattern_id);
+        if (result == null) return null;
+        return std.mem.span(result);
+    }
+
+    pub fn setName(self: *Pattern, pattern_name: []const u8) SvError!void {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+
+        const result = sv.sv_set_pattern_name(info.slot_info.getSlotId(), info.pattern_id, @ptrCast(pattern_name.ptr));
+        if (result < 0) return SvError.FailedToSetPatternName;
+    }
+
+    /// According to the original documentation, the module ID and velocity is offseted by 1, that means:
+    /// if you want to add note to for module 4 with a velocity of 56, you need to insert 5 and 57 accordingly
+    /// inside the []Note slice you have obtained from this function
+    pub fn accessData(self: *Pattern) ![]Note {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        const result: *Note = sv.sv_get_pattern_data(info.slot_info.getSlotId(), info.pattern_id);
+        const result_multi: [*]Note = @ptrCast(result);
+        return result_multi[0..(try self.getAllocatedLineCount() * try self.getAllocatedTrackCount())];
+    }
+};
+
 test "init sunvox library; create and destory SunVox Instances" {
     const version = try init(null, 44100, 2, 0);
     defer deinit();
@@ -1555,4 +1740,36 @@ test "Module Control Test" {
 
     try expectEqual(-128, panning_min);
     try expectEqual(128, panning_max);
+}
+
+test "Pattern Test" {
+    _ = try init(null, 44100, 2, 0);
+    defer deinit();
+
+    const allocator = std.testing.allocator;
+    var slot = try Slot.create(allocator);
+    defer slot.destroy() catch {};
+
+    const pattern = Pattern.fetchFromSlotByID(slot, 0);
+    try std.testing.expect(pattern != null);
+    try expectEqual(32, pattern.?.getAllocatedLineCount());
+    try expectEqual(4, pattern.?.getAllocatedTrackCount());
+
+    var pattern_content = try pattern.?.accessData();
+    try expectEqual(128, pattern_content.len);
+
+    pattern_content[0].note = 65;
+
+    try slot.lock();
+    try pattern.?.setTrackAndLineCount(10, 16);
+    try slot.unlock();
+
+    // The pattern size won't shrink in memory even if the dimension is reduced
+    // which is a normal behavior where the notes won't be erased before saving the project
+    const pattern_content_new = try pattern.?.accessData();
+    try expectEqual(320, pattern_content_new.len);
+    try expectEqual(32, pattern.?.getAllocatedLineCount());
+    try expectEqual(10, pattern.?.getAllocatedTrackCount());
+
+    std.debug.print("first notes: {any}\n", .{pattern_content_new[0]});
 }
