@@ -389,6 +389,7 @@ const SlotPrivateField = struct {
     slot_id: c_int, // The original library capped the number of slots at 16
     is_locked: bool = false,
     active_module_list: std.AutoHashMap(c_int, *Module),
+    allocator: std.mem.Allocator,
 };
 
 /// to prevent user modifying the private field which will corrupt the slot_state_list
@@ -430,13 +431,18 @@ const SlotInfo = opaque {
         return private_field.active_module_list.get(module_id);
     }
 
-    fn clearModuleList(self: *SlotInfo, allocator: std.mem.Allocator) void {
+    fn clearModuleList(self: *SlotInfo) void {
         const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
         var iter = private_field.active_module_list.iterator();
         while (iter.next()) |entry| {
-            allocator.destroy(@as(*ModulePrivateField, @ptrCast(@alignCast(entry.value_ptr.*))));
+            self.getAllocator().destroy(@as(*ModulePrivateField, @ptrCast(@alignCast(entry.value_ptr.*))));
             _ = self.removeModule(entry.key_ptr.*);
         }
+    }
+
+    fn getAllocator(self: *SlotInfo) std.mem.Allocator {
+        const private_field: *SlotPrivateField = @ptrCast(@alignCast(self));
+        return private_field.allocator;
     }
 };
 
@@ -696,11 +702,13 @@ pub const Slot = struct {
                 var private_field = try allocator.create(SlotPrivateField);
                 private_field.slot_id = @intCast(i);
                 private_field.active_module_list = std.AutoHashMap(c_int, *Module).init(allocator);
+                private_field.allocator = allocator;
 
                 var slot = Self{};
                 slot.setupSlot(@ptrCast(private_field));
 
-                const output = try Module.opacifyWithID(allocator, slot._info, 0);
+                // set up module for empty project
+                const output = try Module.opacifyWithID(slot._info, 0);
                 try private_field.active_module_list.put(0, output);
 
                 return slot;
@@ -715,7 +723,7 @@ pub const Slot = struct {
         self.Event._info = slot_info;
     }
 
-    pub fn destroy(self: Self, allocator: std.mem.Allocator) SvError!void {
+    pub fn destroy(self: Self) SvError!void {
         const slot_id = self._info.getSlotId();
         if (slot_state_list[@intCast(slot_id)]) {
             if (sv.sv_close_slot(slot_id) != 0) {
@@ -723,8 +731,9 @@ pub const Slot = struct {
             }
 
             // Clear off the private object, and release the instance_tracker state to inactive
-            self._info.clearModuleList(allocator);
             const slot_info: *SlotPrivateField = @ptrCast(@alignCast(self._info));
+            const allocator = slot_info.allocator;
+            self._info.clearModuleList();
             slot_info.active_module_list.deinit();
             allocator.destroy(slot_info);
             slot_state_list[@intCast(slot_id)] = false;
@@ -760,26 +769,26 @@ const ProjectFn = struct {
     const Self = @This();
     _info: *SlotInfo = undefined,
 
-    pub fn load(self: Self, allocator: std.mem.Allocator, file_path: []const u8) SvError!void {
+    pub fn load(self: Self, file_path: []const u8) SvError!void {
         const result = sv.sv_load(self._info.getSlotId(), @constCast(file_path.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
-        self._info.clearModuleList(allocator);
-        self.opacifyExistingModules(allocator) catch @panic("Critial Memory Integrity Error");
+        self._info.clearModuleList();
+        self.opacifyExistingModules() catch @panic("Critial Memory Integrity Error");
     }
 
-    pub fn loadFromMemory(self: Self, allocator: std.mem.Allocator, data: []const u8) SvError!void {
+    pub fn loadFromMemory(self: Self, data: []const u8) SvError!void {
         const result = sv.sv_load(self._info.getSlotId(), @constCast(data.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
-        self._info.clearModuleList(allocator);
-        self.opacifyExistingModules(allocator) catch @panic("Critial Memory Integrity Error");
+        self._info.clearModuleList();
+        self.opacifyExistingModules() catch @panic("Critial Memory Integrity Error");
     }
 
-    fn opacifyExistingModules(self: Self, allocator: std.mem.Allocator) !void {
+    fn opacifyExistingModules(self: Self) !void {
         const largest_module_id = sv.sv_get_number_of_modules(self._info.getSlotId());
 
         for (0..@intCast(largest_module_id)) |i| {
             if (sv.sv_get_module_flags(self._info.getSlotId(), @intCast(i)) & 1 == 0) continue;
-            const module = try Module.opacifyWithID(allocator, self._info, @intCast(i));
+            const module = try Module.opacifyWithID(self._info, @intCast(i));
             try self._info.registerModule(@intCast(i), module);
         }
     }
@@ -928,8 +937,8 @@ const EventFn = struct {
 
 pub const Module = opaque {
     /// turn module id into trackable reference type such that user can access module at high level
-    fn opacify(allocator: std.mem.Allocator, slot_info: *SlotInfo, module_id: c_int, module_type: ModuleType) !*Module {
-        var module_field = try allocator.create(ModulePrivateField);
+    fn opacify(slot_info: *SlotInfo, module_id: c_int, module_type: ModuleType) !*Module {
+        var module_field = try slot_info.getAllocator().create(ModulePrivateField);
         module_field.module_id = module_id;
         module_field.module_type = module_type;
         module_field.slot_info = slot_info;
@@ -940,17 +949,17 @@ pub const Module = opaque {
         return module;
     }
 
-    fn opacifyWithID(allocator: std.mem.Allocator, slot_info: *SlotInfo, module_id: c_int) !*Module {
+    fn opacifyWithID(slot_info: *SlotInfo, module_id: c_int) !*Module {
         // Since we have ensured that module slot is not empty, unless there is an update while I haven't update the library,
         // ModuleType should covers all the possible built-in module type. User modules should only appeared as MetaModule.
         const module_type_str: []const u8 = std.mem.span(sv.sv_get_module_type(slot_info.getSlotId(), module_id));
         const module_type = std.meta.stringToEnum(ModuleType, module_type_str);
         if (module_type == null) return SvError.ModuleNotFound;
 
-        return Module.opacify(allocator, slot_info, module_id, module_type.?) catch @panic(fatalErrorMsg);
+        return Module.opacify(slot_info, module_id, module_type.?) catch @panic(fatalErrorMsg);
     }
 
-    pub fn new(allocator: std.mem.Allocator, slot: Slot, module_type: ModuleType, name: ?[]const u8, x: i32, y: i32, z_layers: u8) !*Module {
+    pub fn new(slot: Slot, module_type: ModuleType, name: ?[]const u8, x: i32, y: i32, z_layers: u8) !*Module {
         if (!slot._info.isLocked()) return SvError.LockRequired;
 
         const result = sv.sv_new_module(
@@ -964,24 +973,24 @@ pub const Module = opaque {
 
         if (result < 0) return SvError.FailedToCreateModule;
 
-        return Module.opacify(allocator, slot._info, result, module_type) catch @panic(fatalErrorMsg);
+        return Module.opacify(slot._info, result, module_type) catch @panic(fatalErrorMsg);
     }
 
-    pub fn load(allocator: std.mem.Allocator, slot: Slot, module_file_path: []const u8, x: i32, y: i32, z_layers: u8) SvError!*Module {
+    pub fn load(slot: Slot, module_file_path: []const u8, x: i32, y: i32, z_layers: u8) SvError!*Module {
         const result = sv.sv_load_module(slot._info.getSlotId(), @ptrCast(module_file_path), x, y, z_layers);
         if (result < 0) return SvError.FailedToCreateModule;
 
-        return Module.opacifyWithID(allocator, slot._info, result) catch @panic(fatalErrorMsg);
+        return Module.opacifyWithID(slot._info, result) catch @panic(fatalErrorMsg);
     }
 
-    pub fn loadFromMemory(allocator: std.mem.Allocator, slot: Slot, data: []const u8, x: i32, y: i32, z_layers: u8) SvError!*Module {
+    pub fn loadFromMemory(slot: Slot, data: []const u8, x: i32, y: i32, z_layers: u8) SvError!*Module {
         const result = sv.sv_load_module_from_memory(slot._info.getSlotId(), @ptrCast(data.ptr), @intCast(data.len), x, y, z_layers);
         if (result < 0) return SvError.FailedToCreateModule;
 
-        return Module.opacifyWithID(allocator, slot._info, result) catch @panic(fatalErrorMsg);
+        return Module.opacifyWithID(slot._info, result) catch @panic(fatalErrorMsg);
     }
 
-    pub fn fetchFromSlot(slot: Slot, module_id: u32) ?*Module {
+    pub fn fetchFromSlotByID(slot: Slot, module_id: u32) ?*Module {
         return slot._info.peekModule(@intCast(module_id));
     }
 
@@ -1000,13 +1009,13 @@ pub const Module = opaque {
         if (result >= 0) return slot._info.peekModule(result) else return null;
     }
 
-    pub fn remove(self: *Module, allocator: std.mem.Allocator) !void {
+    pub fn remove(self: *Module) !void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         if (!info.slot_info.isLocked()) return SvError.LockRequired;
 
         if (sv.sv_remove_module(info.slot_info.getSlotId(), info.module_id) < 0) return SvError.FailedToRemoveModule;
         _ = info.slot_info.removeModule(info.module_id);
-        allocator.destroy(info);
+        info.slot_info.getAllocator().destroy(info);
     }
 
     pub fn connect(self: *Module, target_module: *Module) SvError!void {
@@ -1272,9 +1281,9 @@ test "init sunvox library; create and destory SunVox Instances" {
     const slot_c = try Slot.create(allocator);
 
     const err_msg = "Failed to destroy SunVox Slot";
-    defer slot_a.destroy(allocator) catch @panic(err_msg);
-    defer slot_b.destroy(allocator) catch @panic(err_msg);
-    defer slot_c.destroy(allocator) catch @panic(err_msg);
+    defer slot_a.destroy() catch @panic(err_msg);
+    defer slot_b.destroy() catch @panic(err_msg);
+    defer slot_c.destroy() catch @panic(err_msg);
 
     // validate the instance (slot) ID; however, the use of _private in your
     // project is strongly discouraged because it will cause instance tracking
@@ -1302,7 +1311,7 @@ test "project level function" {
 
     const allocator = std.testing.allocator;
     var slot = try Slot.create(allocator);
-    defer slot.destroy(allocator) catch {};
+    defer slot.destroy() catch {};
 
     // These are the default sunvox project settings
     try expectEqual(125, slot.Project.getBPM());
@@ -1351,21 +1360,21 @@ test "Module Creation Test" {
 
     const allocator = std.testing.allocator;
     var slot = try Slot.create(allocator);
-    defer slot.destroy(allocator) catch {};
+    defer slot.destroy() catch {};
 
     try std.testing.expectError(
         SvError.LockRequired,
-        Module.new(allocator, slot, .Generator, "NOTEY", 0, 0, 1),
+        Module.new(slot, .Generator, "NOTEY", 0, 0, 1),
     );
 
     try slot.lock();
-    const module = try Module.new(allocator, slot, .ADSR, "NOTEY", 0, 0, 1);
+    const module = try Module.new(slot, .ADSR, "NOTEY", 0, 0, 1);
     try slot.unlock();
 
     try expectEqual(ModuleType.ADSR, module.getType());
 
     try slot.lock();
-    module.remove(allocator) catch @panic("Failed To Remove Module");
+    module.remove() catch @panic("Failed To Remove Module");
     try slot.unlock();
 
     try expectEqual(0, slot._info.getSlotId());
@@ -1377,16 +1386,16 @@ test "Module Connection Test" {
 
     const allocator = std.testing.allocator;
     var slot = try Slot.create(allocator);
-    defer slot.destroy(allocator) catch {};
+    defer slot.destroy() catch {};
 
     try slot.lock();
 
-    const multi = try Module.new(allocator, slot, .MultiSynth, ">> Input", 0, 0, 1);
-    const square = try Module.new(allocator, slot, .@"Analog generator", "Square", 96, 0, 1);
-    const saw = try Module.new(allocator, slot, .@"Analog generator", "Saw", 96, 96, 1);
-    const sine = try Module.new(allocator, slot, .@"Analog generator", "Sine", 96, 96 * 2, 1);
-    const filter = try Module.new(allocator, slot, .@"Filter Pro", null, 96 * 2, 0, 1);
-    const output = Module.fetchFromSlot(slot, 0).?;
+    const multi = try Module.new(slot, .MultiSynth, ">> Input", 0, 0, 1);
+    const square = try Module.new(slot, .@"Analog generator", "Square", 96, 0, 1);
+    const saw = try Module.new(slot, .@"Analog generator", "Saw", 96, 96, 1);
+    const sine = try Module.new(slot, .@"Analog generator", "Sine", 96, 96 * 2, 1);
+    const filter = try Module.new(slot, .@"Filter Pro", null, 96 * 2, 0, 1);
+    const output = Module.fetchFromSlotByID(slot, 0).?;
 
     try multi.connect(square);
     try multi.connect(saw);
@@ -1419,11 +1428,11 @@ test "Module Curve Test" {
 
     const allocator = std.testing.allocator;
     var slot = try Slot.create(allocator);
-    defer slot.destroy(allocator) catch {};
+    defer slot.destroy() catch {};
 
     try slot.lock();
 
-    const drawn = try Module.new(allocator, slot, .@"Analog generator", "drawn wave test", 0, 0, 1);
+    const drawn = try Module.new(slot, .@"Analog generator", "drawn wave test", 0, 0, 1);
 
     var curve = try drawn.getCurve(allocator, null);
     defer allocator.free(curve);
