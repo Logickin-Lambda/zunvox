@@ -364,6 +364,7 @@ const SvError = error{
     FailedToSetProjectName,
     FailedToGetTempoInfo,
     FailedToChangeEventSendLatency,
+    FailedToGetEvent,
     FailedToSetEvent,
     FailedToCreateModule,
     FailedToRemoveModule,
@@ -496,9 +497,9 @@ const ModulePrivateField = struct {
 const PatternPrivateField = struct {
     slot_info: *SlotInfo = undefined,
     pattern_id: c_int,
+    active_line_cnt: usize,
+    active_track_cnt: usize,
 };
-
-const ModuleInfo = opaque {};
 
 const SunVoxVersion = packed union {
     raw: u32,
@@ -507,6 +508,14 @@ const SunVoxVersion = packed union {
         minor: u8,
         major: u16,
     },
+};
+
+const TrackColumn = enum(c_int) {
+    note = 0,
+    vel,
+    module,
+    ccee,
+    xxyy,
 };
 
 var sv: SunVoxFunctionTable = undefined;
@@ -718,6 +727,19 @@ pub fn getSampleRate() !u32 {
     } else {
         return SvError.FailedToObtainSampleRate;
     }
+}
+
+pub fn getTicks() u32 {
+    return @intCast(sv.sv_get_ticks());
+}
+
+pub fn getTicksPerSecond() u32 {
+    return @intCast(sv.sv_get_ticks_per_second());
+}
+
+pub fn getLog(size: u16) ?[]u8 {
+    const result = sv.sv_get_log(@intCast(size));
+    return if (result == null) null else std.mem.span(result);
 }
 
 // The behavior of these functions is not known yet, so
@@ -1386,6 +1408,12 @@ pub const Pattern = opaque {
         pattern_field.pattern_id = pattern_id;
         pattern_field.slot_info = slot_info;
 
+        const line_cnt = sv.sv_get_pattern_lines(slot_info.getSlotId(), pattern_id);
+        const track_cnt = sv.sv_get_pattern_tracks(slot_info.getSlotId(), pattern_id);
+
+        pattern_field.active_line_cnt = if (line_cnt > 0) @intCast(line_cnt) else @panic(fatalErrorMsg);
+        pattern_field.active_track_cnt = if (track_cnt > 0) @intCast(track_cnt) else @panic(fatalErrorMsg);
+
         const pattern: *Pattern = @ptrCast(@alignCast(pattern_field));
         try slot_info.registerPattern(pattern_id, pattern);
 
@@ -1468,9 +1496,19 @@ pub const Pattern = opaque {
         if (result < 0) return SvError.FailedToCountLines else return @intCast(result);
     }
 
+    pub fn getActiveLineCount(self: *Pattern) SvError!usize {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        return info.active_line_cnt;
+    }
+
+    pub fn getActiveTrackCount(self: *Pattern) SvError!usize {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        return info.active_track_cnt;
+    }
+
     /// use null to track_cnt or line_cnt if you want to retain either one of the dimensions
     pub fn setTrackAndLineCount(self: *Pattern, track_cnt: ?usize, line_cnt: ?usize) SvError!void {
-        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        var info: *PatternPrivateField = @ptrCast(@alignCast(self));
         if (!info.slot_info.isLocked()) return SvError.LockRequired;
 
         const result = sv.sv_set_pattern_size(
@@ -1480,6 +1518,8 @@ pub const Pattern = opaque {
             if (line_cnt == null) -1 else @intCast(line_cnt.?),
         );
         if (result < 0) return SvError.FailedToSetPatternSize;
+        if (track_cnt) |tc| info.active_track_cnt = tc;
+        if (line_cnt) |lc| info.active_line_cnt = lc;
     }
 
     pub fn getName(self: *Pattern) ?[]const u8 {
@@ -1500,11 +1540,36 @@ pub const Pattern = opaque {
     /// According to the original documentation, the module ID and velocity is offseted by 1, that means:
     /// if you want to add note to for module 4 with a velocity of 56, you need to insert 5 and 57 accordingly
     /// inside the []Note slice you have obtained from this function
-    pub fn accessData(self: *Pattern) ![]Note {
+    pub fn accessRawPatternData(self: *Pattern) ![]Note {
         const info: *PatternPrivateField = @ptrCast(@alignCast(self));
         const result: *Note = sv.sv_get_pattern_data(info.slot_info.getSlotId(), info.pattern_id);
         const result_multi: [*]Note = @ptrCast(result);
         return result_multi[0..(try self.getAllocatedLineCount() * try self.getAllocatedTrackCount())];
+    }
+
+    /// Module Id need +1 offset
+    pub fn getEvent(self: *Pattern, track: u32, line: u32, col: TrackColumn) !u32 {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_get_pattern_event(info.slot_info.getSlotId(), info.pattern_id, @intCast(track), @intCast(line), @intFromEnum(col));
+        if (result < 0) return SvError.FailedToGetEvent else return result;
+    }
+
+    /// Module Id need +1 offset
+    pub fn setEvent(self: *Pattern, track: u32, line: u32, event: Note) !void {
+        const info: *PatternPrivateField = @ptrCast(@alignCast(self));
+        const result = sv.sv_set_pattern_event(
+            info.slot_info.getSlotId(),
+            info.pattern_id,
+            @intCast(track),
+            @intCast(line),
+            @intCast(event.note),
+            @intCast(event.vel),
+            @intCast(event.module),
+            @intCast(event.ccee),
+            @intCast(event.xxyy),
+        );
+
+        if (result < 0) return SvError.FailedToSetEvent;
     }
 };
 
@@ -1755,7 +1820,7 @@ test "Pattern Test" {
     try expectEqual(32, pattern.?.getAllocatedLineCount());
     try expectEqual(4, pattern.?.getAllocatedTrackCount());
 
-    var pattern_content = try pattern.?.accessData();
+    var pattern_content = try pattern.?.accessRawPatternData();
     try expectEqual(128, pattern_content.len);
 
     pattern_content[0].note = 65;
@@ -1766,10 +1831,13 @@ test "Pattern Test" {
 
     // The pattern size won't shrink in memory even if the dimension is reduced
     // which is a normal behavior where the notes won't be erased before saving the project
-    const pattern_content_new = try pattern.?.accessData();
+    const pattern_content_new = try pattern.?.accessRawPatternData();
     try expectEqual(320, pattern_content_new.len);
     try expectEqual(32, pattern.?.getAllocatedLineCount());
     try expectEqual(10, pattern.?.getAllocatedTrackCount());
 
     std.debug.print("first notes: {any}\n", .{pattern_content_new[0]});
+
+    // Thus, this is the reason why I have getActiveXXXCount functions
+    // so that you can get the dimension that is actually played during playback.
 }
