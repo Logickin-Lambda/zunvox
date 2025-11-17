@@ -1,4 +1,33 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+fn getSunVoxLibraryPath() struct { []const u8, []const u8 } {
+    switch (builtin.os.tag) {
+        .windows => {
+            switch (builtin.cpu.arch) {
+                .x86_64 => return .{ "libs/sunvox/windows/lib_x86_64/sunvox.dll", "sunvox.dll" },
+                else => return .{ "libs/sunvox/windows/lib_x86/sunvox.dll", "sunvox.dll" },
+            }
+        },
+        .macos => {
+            switch (builtin.cpu.arch) {
+                .x86_64 => return .{ "libs/sunvox/macos/lib_x86_64/sunvox.dylib", "sunvox.dylib" },
+                else => return .{ "libs/sunvox/macos/lib_arm64/sunvox.dylib", "sunvox.dylib" },
+            }
+        },
+        .linux => {
+            switch (builtin.cpu.arch) {
+                .arm => @panic("Arm based SunVox lib is not support for linux yet"),
+                .x86_64 => return .{ "libs/sunvox/linux/lib_x86_64/sunvox.so", "sunvox.so" },
+                .x86 => return .{ "libs/sunvox/linux/lib_x86/sunvox.so", "sunvox.so" },
+                else => @panic("Linux is a bit more complicated in the choice of CPU, \nPlease submit an issue if you have found an unsupported CPU for the existing SunVox Lib"),
+            }
+        },
+        else => {
+            @panic("ZunVox is not available in your current operating system yet");
+        },
+    }
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -9,8 +38,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    // let's only consider 64bit windows first before moving onto other system
-    b.getInstallStep().dependOn(&b.addInstallBinFile(b.path("libs/sunvox/windows/lib_x86_64/sunvox.dll"), "sunvox.dll").step);
+    // let's only consider 64bit windows first before moving onto other systems
+    const src, const dest = getSunVoxLibraryPath();
+    b.getInstallStep().dependOn(&b.addInstallBinFile(b.path(src), dest).step);
 
     // setting up test
     const test_step = b.step("test", "zunvox tests");
@@ -41,14 +71,19 @@ pub fn installSunVoxBinary(
     install_dir: std.Build.InstallDir,
 ) void {
     const b = step.owner;
+    const src, const dest = getSunVoxLibraryPath();
+
     step.dependOn(
         &b.addInstallFileWithDir(
-            .{ .dependency = .{
-                .dependency = sunvox_dll,
-                .sub_path = "libs/sunvox/windows/lib_x86_64/sunvox.dll",
-            } },
+            .{
+                .dependency = .{
+                    .dependency = sunvox_dll,
+                    // .sub_path = "libs/sunvox/windows/lib_x86_64/sunvox.dll",
+                    .sub_path = src,
+                },
+            },
             install_dir,
-            "sunvox.dll",
+            dest,
         ).step,
     );
 }

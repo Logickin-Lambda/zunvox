@@ -1,7 +1,14 @@
 # ZunVox, A More Intuitive SunVox Library Written In zig
 
+### Todo:
+- [ ] Address the random segmentation fault during the first build to the project (Non-Critical bug since the library still runs without any issue)
+- [ ] An async controller queue to ensure the controller parameter being update before project save. (zig 0.16.0 features required)
+- [ ] More os support (currently windows, mac, and x86_64 Linux)
+- [ ] Enable the Audio Callback and any other missing functions
+- [ ] Replace function parameters and return type more idiomatic to zig.
+
 ### Story
-I have a couple of sunvox project on hand, including the VOXCOM 1610 assembler and the Preset bank generator which these project are based on the [SunVox Library](https://warmplace.ru/soft/sunvox/sunvox_lib.php).The original library is not hard to use, as you can see, you can just load the dynamic/share library like shown, which is surprisingly simple for zig:
+I have a couple of sunvox project on hand, including the VOXCOM 1610 assembler and the Preset bank generator which these projects are based on the [SunVox Library](https://warmplace.ru/soft/sunvox/sunvox_lib.php).The original library is not hard to use, as you can see, you can just load the dynamic/share library like shown, which is surprisingly simple for zig:
 
 ``` zig
 pub fn main(){

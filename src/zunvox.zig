@@ -1642,22 +1642,22 @@ test "project level function" {
 // I actually want to turn this forum post into an actual feature
 //
 // Noties are instrument characters that assist you in placing and deleting them.
-// White: Synth Notey
-// Blue: Piano Notey
-// Green: 2nd Synth Notey
-// Turquoise: Xylo Notey (what)
-// Red: Choir Notey
-// Pink: Pad Notey
-// Yellow: Bass Notey
-// Orange: 2nd Bass Notey
-// Cyan: Sound Notey (???)
-// Green Yellow: Bass Kick Notey
-// Green Blue: Bass Drum Notey (yep)
-// Pink Red: Clap Notey
-// Blue Turquoise: Cymbal Notey
-// Green White: Hi-Hat Notey
-// Green Red: Tiss Notey
-// Pink Red: Snare Notey
+// White: Synth Notey               -> generic synth
+// Blue: Piano Notey                -> subtractive keys
+// Green: 2nd Synth Notey           -> generic super-waved synth
+// Turquoise: Xylo Notey (what)     -> fm keys
+// Red: Choir Notey                 -> super-waved pad
+// Pink: Pad Notey                  -> simple pad
+// Yellow: Bass Notey               -> sustained bass
+// Orange: 2nd Bass Notey           -> plucked bass
+// Cyan: Sound Notey (???)          -> fx
+// Green Yellow: Bass Kick Notey    -> pitch attacked bass
+// Green Blue: Bass Drum Notey (yep)-> modeled kick
+// Pink Red: Clap Notey             -> modeled clap
+// Blue Turquoise: Cymbal Notey     -> modeled cymbals
+// Green White: Hi-Hat Notey        -> modeled high hats
+// Green Red: Tiss Notey            -> sticks and clicking sounds
+// Pink Red: Snare Notey            -> moduled snare
 // Noties are the most features in PixiTracker. Use them.
 //
 // Looks like this can be some kind of magical, generative synth patches.
