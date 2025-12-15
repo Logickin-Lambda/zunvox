@@ -716,8 +716,12 @@ pub fn deinit() void {
         }
     }
     assert(!is_active_instance_remains);
+    _ = sv.sv_deinit();
 
-    dll.close();
+    // TODO, Seems closing the share library directly causes the segmentation fault, but because this only be closed during
+    // shutting off the library which is usually called at the end of the program, we could just ignore this process and
+    // let the os clear the remaining resources.
+    // dll.close();
 }
 
 pub fn getSampleRate() !u32 {
