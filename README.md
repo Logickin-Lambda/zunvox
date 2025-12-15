@@ -1,7 +1,7 @@
 # ZunVox, A More Intuitive SunVox Library Written In zig
 
 ### Todo:
-- [ ] Address the random segmentation fault during the first build to the project (Non-Critical bug since the library still runs without any issue)
+- [x] Address the random segmentation fault during the first build to the project (Fixed, missing sv_deinit() should be the original cause)
 - [ ] An async controller queue to ensure the controller parameter being update before project save. (zig 0.16.0 features required)
 - [ ] More os support (currently windows, mac, and x86_64 Linux)
 - [ ] Enable the Audio Callback and any other missing functions
