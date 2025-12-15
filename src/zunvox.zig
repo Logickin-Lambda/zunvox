@@ -341,7 +341,7 @@ pub const ControlScale = enum(c_int) {
 
 // Here are the list of errors for the library, to replace the negative value used for the original library
 // so that to provide a clearer ideas of what goes wrong with your projects
-const SvError = error{
+pub const SvError = error{
     FailedToInitizeGlobalSoundSystem,
     FailedToCraeteSunVoxSlot,
     MaximumSlotExceeded,
