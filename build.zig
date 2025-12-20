@@ -1,22 +1,22 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-fn getSunVoxLibraryPath() struct { []const u8, []const u8 } {
-    switch (builtin.os.tag) {
+fn getSunVoxLibraryPath(target: std.Target) struct { []const u8, []const u8 } {
+    switch (target.os.tag) {
         .windows => {
-            switch (builtin.cpu.arch) {
+            switch (target.cpu.arch) {
                 .x86_64 => return .{ "libs/sunvox/windows/lib_x86_64/sunvox.dll", "sunvox.dll" },
                 else => return .{ "libs/sunvox/windows/lib_x86/sunvox.dll", "sunvox.dll" },
             }
         },
         .macos => {
-            switch (builtin.cpu.arch) {
+            switch (target.cpu.arch) {
                 .x86_64 => return .{ "libs/sunvox/macos/lib_x86_64/sunvox.dylib", "sunvox.dylib" },
                 else => return .{ "libs/sunvox/macos/lib_arm64/sunvox.dylib", "sunvox.dylib" },
             }
         },
         .linux => {
-            switch (builtin.cpu.arch) {
+            switch (target.cpu.arch) {
                 .arm => @panic("Arm based SunVox lib is not support for linux yet"),
                 .x86_64 => return .{ "libs/sunvox/linux/lib_x86_64/sunvox.so", "sunvox.so" },
                 .x86 => return .{ "libs/sunvox/linux/lib_x86/sunvox.so", "sunvox.so" },
@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // let's only consider 64bit windows first before moving onto other systems
-    const src, const dest = getSunVoxLibraryPath();
+    const src, const dest = getSunVoxLibraryPath(target.result);
     b.getInstallStep().dependOn(&b.addInstallBinFile(b.path(src), dest).step);
 
     // setting up test
@@ -67,14 +67,14 @@ pub fn build(b: *std.Build) void {
 }
 
 pub fn installSunVoxBinary(
-    step: *std.Build.Step,
+    exe: *std.Build.Step.Compile,
     sunvox_dll: *std.Build.Dependency,
     install_dir: std.Build.InstallDir,
 ) void {
-    const b = step.owner;
-    const src, const dest = getSunVoxLibraryPath();
+    const b = exe.step.owner;
+    const src, const dest = getSunVoxLibraryPath(exe.rootModuleTarget());
 
-    step.dependOn(
+    exe.step.dependOn(
         &b.addInstallFileWithDir(
             .{
                 .dependency = .{
