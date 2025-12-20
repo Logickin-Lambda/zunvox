@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
     const zunvox = b.addModule("zunvox", .{
         .root_source_file = b.path("src/zunvox.zig"),
         .target = target,
+        .link_libc = true,
     });
 
     // let's only consider 64bit windows first before moving onto other systems

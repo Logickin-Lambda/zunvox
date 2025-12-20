@@ -30,7 +30,7 @@ const tsv_update_input = *const fn () callconv(.c) c_int;
 const tsv_load = *const fn (slot: c_int, name: [*c]u8) callconv(.c) c_int;
 const tsv_load_from_memory = *const fn (slot: c_int, data: *anyopaque, data_size: c_uint) callconv(.c) c_int;
 const tsv_save = *const fn (slot: c_int, name: [*c]u8) callconv(.c) c_int;
-const tsv_save_to_memory = *const fn (slot: c_int, size: *usize) callconv(.c) *anyopaque;
+const tsv_save_to_memory = *const fn (slot: c_int, size: *usize) callconv(.c) ?*anyopaque;
 const tsv_play = *const fn (slot: c_int) callconv(.c) c_int;
 const tsv_play_from_beginning = *const fn (slot: c_int) callconv(.c) c_int;
 const tsv_stop = *const fn (slot: c_int) callconv(.c) c_int;
@@ -226,7 +226,7 @@ fn getModuleTypeStr(module_type: ModuleType) []const u8 {
         .SpectraVoice => "SpectraVoice",
         .Amplifier => "Amplifier",
         .Compressor => "Compressor",
-        .@"DC Blocker" => "DC_Blocker",
+        .@"DC Blocker" => "DC Blocker",
         .Delay => "Delay",
         .Distortion => "Distortion",
         .Echo => "Echo",
@@ -253,7 +253,7 @@ fn getModuleTypeStr(module_type: ModuleType) []const u8 {
         .MultiCtl => "MultiCtl",
         .MultiSynth => "MultiSynth",
         .Pitch2Ctl => "Pitch2Ctl",
-        .@"Pitch Detector" => "Pitch_Detector",
+        .@"Pitch Detector" => "Pitch Detector",
         .Sound2Ctl => "Sound2Ctl",
         .Velocity2Ctl => "Velocity2Ctl",
         .Output => "Output",
@@ -304,24 +304,25 @@ pub const ModuleFlags = packed union {
 
 pub const ModuleLocation = packed union {
     raw: u32,
-    axis: struct {
+    axis: packed struct {
         x: u16,
         y: u16,
     },
 };
 
 pub const Color = packed union {
-    raw: u32,
-    col: struct {
+    raw: c_int,
+    col: packed struct {
         r: u8,
         g: u8,
         b: u8,
+        padding: u8,
     },
 };
 
 pub const DetuneProperties = packed union {
     raw: u32,
-    pitch: struct {
+    pitch: packed struct {
         rel: i16,
         fine: i16,
     },
@@ -342,6 +343,7 @@ pub const ControlScale = enum(c_int) {
 // Here are the list of errors for the library, to replace the negative value used for the original library
 // so that to provide a clearer ideas of what goes wrong with your projects
 pub const SvError = error{
+    OutOfMemory,
     FailedToInitizeGlobalSoundSystem,
     FailedToCraeteSunVoxSlot,
     MaximumSlotExceeded,
@@ -371,6 +373,7 @@ pub const SvError = error{
     FailedToConnectModule,
     FailedToDisconnectedModule,
     LockRequired,
+    UnlockRequired,
     NotSampler,
     NotMetaModule,
     NotMultiSynth,
@@ -841,7 +844,7 @@ const ProjectFn = struct {
     const Self = @This();
     _info: *SlotInfo = undefined,
 
-    pub fn load(self: Self, file_path: []const u8) SvError!void {
+    pub fn load(self: Self, file_path: [:0]const u8) SvError!void {
         const result = sv.sv_load(self._info.getSlotId(), @constCast(file_path.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
         self._info.clearModuleList();
@@ -851,7 +854,7 @@ const ProjectFn = struct {
     }
 
     pub fn loadFromMemory(self: Self, data: []const u8) SvError!void {
-        const result = sv.sv_load(self._info.getSlotId(), @constCast(data.ptr));
+        const result = sv.sv_load_from_memory(self._info.getSlotId(), @constCast(data.ptr), @intCast(data.len));
         if (result < 0) return SvError.FailedToLoadProject;
         self._info.clearModuleList();
         self._info.clearPatternList();
@@ -885,7 +888,23 @@ const ProjectFn = struct {
         if (result < 0) return SvError.FailedToSaveProject;
     }
 
-    // TODO: Need to figure out how to destroy a chunk of memory create in shared library for save_memory()
+    // TODO: Need to figure out how to destroy a chunk of memory create in the shared library for save_memory()
+    // pub fn saveToMemory(self: Self, allocator: std.mem.Allocator) SvError!?[]u8 {
+    //     var file_size: usize = 0;
+    //     const anyopaque_ptr = sv.sv_save_to_memory(self._info.getSlotId(), &file_size);
+    //     if (anyopaque_ptr) |ptr| {
+    //         const slice: []const u8 = @as([*]u8, @ptrCast(ptr))[0..file_size];
+    //         const result: []u8 = allocator.dupe(u8, slice) catch return SvError.OutOfMemory;
+
+    //         std.debug.print("Must be here, right?\n", .{});
+    //         std.c.free(ptr);
+    //         std.debug.print("And cannot goes past this function?\n", .{});
+
+    //         return result;
+    //     } else {
+    //         return null;
+    //     }
+    // }
 
     pub fn play(self: Self) SvError!void {
         const result = sv.sv_play(self._info.getSlotId());
@@ -948,14 +967,14 @@ const ProjectFn = struct {
         return @intCast(sv.sv_get_current_signal_level(self._info.getSlotId(), @intCast(channel)));
     }
 
-    pub fn getName(self: Self) ?[]const u8 {
+    pub fn getName(self: Self) ?[:0]const u8 {
         const result = sv.sv_get_song_name(self._info.getSlotId());
         if (result == null) return null;
         return std.mem.span(result);
     }
 
-    pub fn setName(self: Self, name: []const u8) SvError!void {
-        const result = sv.sv_set_song_name(self._info.getSlotId(), @ptrCast(name.ptr));
+    pub fn setName(self: Self, name: [:0]const u8) SvError!void {
+        const result = sv.sv_set_song_name(self._info.getSlotId(), @constCast(name.ptr));
         if (result < 0) return SvError.FailedToSetProjectName;
     }
 
@@ -1047,7 +1066,7 @@ pub const Module = opaque {
         return Module.opacify(slot_info, module_id, module_type.?) catch @panic(fatalErrorMsg);
     }
 
-    pub fn new(slot: Slot, module_type: ModuleType, name: ?[]const u8, x: i32, y: i32, z_layers: u8) !*Module {
+    pub fn new(slot: *Slot, module_type: ModuleType, name: ?[:0]const u8, x: i32, y: i32, z_layers: u8) !*Module {
         if (!slot._info.isLocked()) return SvError.LockRequired;
 
         const result = sv.sv_new_module(
@@ -1064,35 +1083,35 @@ pub const Module = opaque {
         return Module.opacify(slot._info, result, module_type) catch @panic(fatalErrorMsg);
     }
 
-    pub fn load(slot: Slot, module_file_path: []const u8, x: i32, y: i32, z_layers: u8) SvError!*Module {
+    pub fn load(slot: *Slot, module_file_path: [:0]const u8, x: i32, y: i32, z_layers: u8) SvError!*Module {
         const result = sv.sv_load_module(slot._info.getSlotId(), @ptrCast(module_file_path), x, y, z_layers);
         if (result < 0) return SvError.FailedToCreateModule;
 
         return Module.opacifyWithID(slot._info, result) catch @panic(fatalErrorMsg);
     }
 
-    pub fn loadFromMemory(slot: Slot, data: []const u8, x: i32, y: i32, z_layers: u8) SvError!*Module {
-        const result = sv.sv_load_module_from_memory(slot._info.getSlotId(), @ptrCast(data.ptr), @intCast(data.len), x, y, z_layers);
+    pub fn loadFromMemory(slot: *Slot, data: []const u8, x: i32, y: i32, z_layers: u8) SvError!*Module {
+        const result = sv.sv_load_module_from_memory(slot._info.getSlotId(), @constCast(data.ptr), @intCast(data.len), x, y, z_layers);
         if (result < 0) return SvError.FailedToCreateModule;
 
         return Module.opacifyWithID(slot._info, result) catch @panic(fatalErrorMsg);
     }
 
-    pub fn fetchFromSlotByID(slot: Slot, module_id: u32) ?*Module {
+    pub fn fetchFromSlotByID(slot: *Slot, module_id: u32) ?*Module {
         return slot._info.peekModule(@intCast(module_id));
     }
 
-    pub fn getLargestModuleID(slot: Slot) !u32 {
+    pub fn getLargestModuleID(slot: *Slot) !u32 {
         const result = sv.sv_get_number_of_modules(slot._info.getSlotId());
         if (result < 0) return SvError.FailedToCountModule;
     }
 
-    pub fn getNumberOfModules(slot: Slot) !u32 {
+    pub fn getNumberOfModules(slot: *Slot) !u32 {
         const info: *SlotPrivateField = @ptrCast(@alignCast(slot._info));
         return info.active_module_list.count();
     }
 
-    pub fn findModuleByName(slot: Slot, module_name: []u8) ?*Module {
+    pub fn findModuleByName(slot: *Slot, module_name: [:0]u8) ?*Module {
         const result = sv.sv_find_module(slot._info.getSlotId(), @ptrCast(module_name.ptr));
         if (result >= 0) return slot._info.peekModule(result) else return null;
     }
@@ -1106,6 +1125,9 @@ pub const Module = opaque {
         info.slot_info.getAllocator().destroy(info);
     }
 
+    /// The more accurate behavior is actually toggle connection between modules.
+    /// If the module has already made the connection to the target module,
+    /// calling it again will undo the connection.
     pub fn connect(self: *Module, target_module: *Module) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         const tar_info: *ModulePrivateField = @ptrCast(@alignCast(target_module));
@@ -1127,18 +1149,18 @@ pub const Module = opaque {
         return info.module_type;
     }
 
-    pub fn loadSample(self: *Module, sample_file_path: []const u8, sample_slot: u32) SvError!void {
+    pub fn loadSample(self: *Module, sample_file_path: [:0]const u8, sample_slot: u32) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         if (self.getType() != .Sampler) return SvError.NotSampler;
-        const result = sv.sv_sampler_load(info.slot_info.getSlotId(), info.module_id, @ptrCast(sample_file_path.ptr), @intCast(sample_slot));
+        const result = sv.sv_sampler_load(info.slot_info.getSlotId(), info.module_id, @constCast(sample_file_path.ptr), @intCast(sample_slot));
 
         if (result < 0) return SvError.FailedToLoadSample;
     }
 
-    pub fn overrideAllSampleSlots(self: *Module, sample_file_path: []const u8) SvError!void {
+    pub fn overrideAllSampleSlots(self: *Module, sample_file_path: [:0]const u8) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         if (self.getType() != .Sampler) return SvError.NotSampler;
-        const result = sv.sv_sampler_load(info.slot_info.getSlotId(), info.module_id, @ptrCast(sample_file_path.ptr), -1);
+        const result = sv.sv_sampler_load(info.slot_info.getSlotId(), info.module_id, @constCast(sample_file_path.ptr), -1);
 
         if (result < 0) return SvError.FailedToLoadSample;
     }
@@ -1146,7 +1168,7 @@ pub const Module = opaque {
     pub fn loadSampleFromMemory(self: *Module, data: []const u8, sample_slot: u32) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         if (self.getType() != .Sampler) return SvError.NotSampler;
-        const result = sv.sv_sampler_load_from_memory(info.slot_info.getSlotId(), info.module_id, @ptrCast(data.ptr), @intCast(data.len), @intCast(sample_slot));
+        const result = sv.sv_sampler_load_from_memory(info.slot_info.getSlotId(), info.module_id, @constCast(data.ptr), @intCast(data.len), @intCast(sample_slot));
 
         if (result < 0) return SvError.FailedToLoadSample;
     }
@@ -1154,7 +1176,7 @@ pub const Module = opaque {
     pub fn overrideAllSampleSlotsFromMemory(self: *Module, data: []const u8) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         if (self.getType() != .Sampler) return SvError.NotSampler;
-        const result = sv.sv_sampler_load_from_memory(info.slot_info.getSlotId(), info.module_id, @ptrCast(data.ptr), @intCast(data.len), -1);
+        const result = sv.sv_sampler_load_from_memory(info.slot_info.getSlotId(), info.module_id, @constCast(data.ptr), @intCast(data.len), -1);
 
         if (result < 0) return SvError.FailedToLoadSample;
     }
@@ -1174,11 +1196,11 @@ pub const Module = opaque {
         _ = sv.sv_sampler_par(info.slot_info.getSlotId(), info.module_id, @intCast(sample_slot), @intFromEnum(param_type), param_val.raw, 1);
     }
 
-    pub fn loadProjectToMetaModule(self: *Module, sunvox_file_path: []const u8) SvError!void {
+    pub fn loadProjectToMetaModule(self: *Module, sunvox_file_path: [:0]const u8) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         if (self.getType() != .MetaModule) return SvError.NotMetaModule;
 
-        const result = sv.sv_metamodule_load(info.slot_info.getSlotId(), info.module_id, @ptrCast(sunvox_file_path.ptr));
+        const result = sv.sv_metamodule_load(info.slot_info.getSlotId(), info.module_id, @constCast(sunvox_file_path.ptr));
         if (result < 0) return SvError.FailedToLoadProject;
     }
 
@@ -1186,7 +1208,7 @@ pub const Module = opaque {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         if (self.getType() != .MetaModule) return SvError.NotMetaModule;
 
-        const result = sv.sv_metamodule_load_from_memory(info.slot_info.getSlotId(), info.module_id, @ptrCast(data.ptr), @intCast(data.len));
+        const result = sv.sv_metamodule_load_from_memory(info.slot_info.getSlotId(), info.module_id, @constCast(data.ptr), @intCast(data.len));
         if (result < 0) return SvError.FailedToLoadProject;
     }
 
@@ -1235,7 +1257,7 @@ pub const Module = opaque {
         return cnt;
     }
 
-    pub fn getName(self: *Module) ?[]const u8 {
+    pub fn getName(self: *Module) ?[:0]const u8 {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
 
         const result = sv.sv_get_module_name(info.slot_info.getSlotId(), info.module_id);
@@ -1243,10 +1265,10 @@ pub const Module = opaque {
         return std.mem.span(result);
     }
 
-    pub fn setName(self: *Module, module_name: []const u8) SvError!void {
+    pub fn setName(self: *Module, module_name: [:0]const u8) SvError!void {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
 
-        const result = sv.sv_set_module_name(info.slot_info.getSlotId(), info.module_id, @ptrCast(module_name.ptr));
+        const result = sv.sv_set_module_name(info.slot_info.getSlotId(), info.module_id, @constCast(module_name.ptr));
         if (result < 0) return SvError.FailedToSetModuleName;
     }
 
@@ -1295,7 +1317,7 @@ pub const Module = opaque {
         return @intCast(result);
     }
 
-    pub fn getCurve(self: *Module, allocator: std.mem.Allocator, curve_type: ?CurveType) ![]f32 {
+    pub fn getCurveAlloc(self: *Module, allocator: std.mem.Allocator, curve_type: ?CurveType) ![]f32 {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         var buffer: []f32 = undefined;
 
@@ -1322,6 +1344,23 @@ pub const Module = opaque {
             return SvError.FailedToAccessModuleCurve;
         } else {
             return buffer;
+        }
+    }
+
+    pub fn getCurveBuf(self: *Module, curve_buf: []f32, curve_type: ?CurveType) ![]f32 {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+
+        switch (info.module_type) {
+            .MultiSynth, .Waveshaper, .MultiCtl, .@"Analog generator", .FMX => {},
+            else => return SvError.ModuleNotSupported,
+        }
+
+        const curve_id: c_int = if (info.module_type != .MultiSynth) 0 else if (curve_type == null) 0 else @intCast(@intFromEnum(curve_type.?));
+        const result = sv.sv_module_curve(info.slot_info.getSlotId(), info.module_id, curve_id, @ptrCast(curve_buf.ptr), @intCast(curve_buf.len), 0);
+        if (result < 0) {
+            return SvError.FailedToAccessModuleCurve;
+        } else {
+            return curve_buf;
         }
     }
 
@@ -1356,15 +1395,28 @@ pub const Module = opaque {
         return @intCast(result);
     }
 
-    pub fn getControlName(self: *Module, control_id: usize) SvError!?[]u8 {
+    pub fn getControlName(self: *Module, control_id: usize) SvError!?[:0]u8 {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
         const result = sv.sv_get_module_ctl_name(info.slot_info.getSlotId(), info.module_id, @intCast(control_id - VISUAL_CONTROL_OFFSET));
         if (result == null) return null;
         return std.mem.span(result);
     }
 
-    pub fn getControlValue(self: *Module, control_id: usize, scale: ControlScale) i32 {
+    /// A hidden behavior has been found for getting control values, and it turns out when the engine is in the lock state,
+    /// the module controllers will stuck at the value before lock. Thus, to ensure safety, the zunvox version will perform
+    /// a lock check, preventing users to access this function with getting the wrong value or even in a deadly infinite loop.
+    /// If you are looking for the original behavior for sv_get_module_ctl_value, please use getControlValueUnsafe() instead
+    pub fn getControlValue(self: *Module, control_id: usize, scale: ControlScale) !i32 {
         const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+        if (info.slot_info.isLocked()) return SvError.UnlockRequired;
+
+        return getControlValueUnsafe(self, control_id, scale);
+    }
+
+    /// This version has the original behavior of sv_get_module_ctl_value; use it wisely.
+    pub fn getControlValueUnsafe(self: *Module, control_id: usize, scale: ControlScale) i32 {
+        const info: *ModulePrivateField = @ptrCast(@alignCast(self));
+
         const result = sv.sv_get_module_ctl_value(info.slot_info.getSlotId(), info.module_id, @intCast(control_id - VISUAL_CONTROL_OFFSET), @intFromEnum(scale));
         return @intCast(result);
     }
@@ -1420,7 +1472,7 @@ pub const Pattern = opaque {
         return pattern;
     }
 
-    pub fn new(slot: Slot, clone: ?*Pattern, x: i32, y: i32, track_cnt: u32, line_cnt: u32, icon_seed: ?i32, pattern_name: ?[]u32) !*Pattern {
+    pub fn new(slot: *Slot, clone: ?*Pattern, x: i32, y: i32, track_cnt: u32, line_cnt: u32, icon_seed: ?i32, pattern_name: ?[:0]u32) !*Pattern {
         if (!slot._info.isLocked()) return SvError.LockRequired;
 
         const auto_icon_seed: c_int = if (icon_seed) |isd| @intCast(isd) else std.crypto.random.int(c_int);
@@ -1439,21 +1491,21 @@ pub const Pattern = opaque {
         return Pattern.opacify(slot._info, result);
     }
 
-    pub fn fetchFromSlotByID(slot: Slot, pattern_id: u32) ?*Pattern {
+    pub fn fetchFromSlotByID(slot: *Slot, pattern_id: u32) ?*Pattern {
         return slot._info.peekPattern(@intCast(pattern_id));
     }
 
-    pub fn getLargestPatternID(slot: Slot) !u32 {
+    pub fn getLargestPatternID(slot: *Slot) !u32 {
         const result = sv.sv_get_number_of_patterns(slot._info.getSlotId());
         if (result < 0) SvError.FailedToCountPattern;
     }
 
-    pub fn countNumberOfPatterns(slot: Slot) !u32 {
+    pub fn countNumberOfPatterns(slot: *Slot) !u32 {
         const info: *SlotPrivateField = @ptrCast(@alignCast(slot._info));
         return info.active_pattern_list.count();
     }
 
-    pub fn findPatternByName(slot: Slot, pattern_name: []u8) ?*Pattern {
+    pub fn findPatternByName(slot: *Slot, pattern_name: [:0]u8) ?*Pattern {
         const result = sv.sv_find_pattern(slot._info.getSlotId(), @ptrCast(pattern_name.ptr));
         if (result >= 0) return slot._info.peekPattern(result) else return null;
     }
@@ -1530,7 +1582,7 @@ pub const Pattern = opaque {
         return std.mem.span(result);
     }
 
-    pub fn setName(self: *Pattern, pattern_name: []const u8) SvError!void {
+    pub fn setName(self: *Pattern, pattern_name: [:0]const u8) SvError!void {
         const info: *PatternPrivateField = @ptrCast(@alignCast(self));
 
         const result = sv.sv_set_pattern_name(info.slot_info.getSlotId(), info.pattern_id, @ptrCast(pattern_name.ptr));
@@ -1675,11 +1727,11 @@ test "Module Creation Test" {
 
     try std.testing.expectError(
         SvError.LockRequired,
-        Module.new(slot, .Generator, "NOTEY", 0, 0, 1),
+        Module.new(&slot, .Generator, "NOTEY", 0, 0, 1),
     );
 
     try slot.lock();
-    const module = try Module.new(slot, .ADSR, "NOTEY", 0, 0, 1);
+    const module = try Module.new(&slot, .ADSR, "NOTEY", 0, 0, 1);
     try slot.unlock();
 
     try expectEqual(ModuleType.ADSR, module.getType());
@@ -1701,12 +1753,12 @@ test "Module Connection Test" {
 
     try slot.lock();
 
-    const multi = try Module.new(slot, .MultiSynth, ">> Input", 0, 0, 1);
-    const square = try Module.new(slot, .@"Analog generator", "Square", 96, 0, 1);
-    const saw = try Module.new(slot, .@"Analog generator", "Saw", 96, 96, 1);
-    const sine = try Module.new(slot, .@"Analog generator", "Sine", 96, 96 * 2, 1);
-    const filter = try Module.new(slot, .@"Filter Pro", null, 96 * 2, 0, 1);
-    const output = Module.fetchFromSlotByID(slot, 0).?;
+    const multi = try Module.new(&slot, .MultiSynth, ">> Input", 0, 0, 1);
+    const square = try Module.new(&slot, .@"Analog generator", "Square", 96, 0, 1);
+    const saw = try Module.new(&slot, .@"Analog generator", "Saw", 96, 96, 1);
+    const sine = try Module.new(&slot, .@"Analog generator", "Sine", 96, 96 * 2, 1);
+    const filter = try Module.new(&slot, .@"Filter Pro", null, 96 * 2, 0, 1);
+    const output = Module.fetchFromSlotByID(&slot, 0).?;
 
     try multi.connect(square);
     try multi.connect(saw);
@@ -1742,10 +1794,10 @@ test "Module Curve Test" {
     defer slot.destroy() catch {};
 
     try slot.lock();
-    const drawn = try Module.new(slot, .@"Analog generator", "drawn wave test", 0, 0, 1);
+    const drawn = try Module.new(&slot, .@"Analog generator", "drawn wave test", 0, 0, 1);
     try slot.unlock();
 
-    var curve = try drawn.getCurve(allocator, null);
+    var curve = try drawn.getCurveAlloc(allocator, null);
     defer allocator.free(curve);
 
     for (0..curve.len) |i| {
@@ -1754,7 +1806,7 @@ test "Module Curve Test" {
 
     try drawn.setCurve(null, curve);
 
-    const curve_new = try drawn.getCurve(allocator, null);
+    const curve_new = try drawn.getCurveAlloc(allocator, null);
     defer allocator.free(curve_new);
 
     for (curve, curve_new) |elements, elements_new| {
@@ -1772,7 +1824,7 @@ test "Module Control Test" {
     defer slot.destroy() catch {};
 
     try slot.lock();
-    const drawn = try Module.new(slot, .@"Analog generator", "drawn wave test", 0, 0, 1);
+    const drawn = try Module.new(&slot, .@"Analog generator", "drawn wave test", 0, 0, 1);
     try slot.unlock();
 
     const control_cnt = try drawn.getControlCount();
@@ -1781,9 +1833,9 @@ test "Module Control Test" {
     const control_name = try drawn.getControlName(0xA);
     try std.testing.expect(std.mem.eql(u8, "Filter", control_name.?));
 
-    const panning_display = drawn.getControlValue(3, .display);
-    const panning_xxyy = drawn.getControlValue(3, .xxyy_map);
-    const panning_raw = drawn.getControlValue(3, .raw);
+    const panning_display = try drawn.getControlValue(3, .display);
+    const panning_xxyy = try drawn.getControlValue(3, .xxyy_map);
+    const panning_raw = try drawn.getControlValue(3, .raw);
     try expectEqual(0, panning_display);
     try expectEqual(0x4000, panning_xxyy);
     try expectEqual(128, panning_raw);
@@ -1792,9 +1844,9 @@ test "Module Control Test" {
 
     std.Thread.sleep(1e9);
 
-    const panning_display_new = drawn.getControlValue(3, .display);
-    const panning_xxyy_new = drawn.getControlValue(3, .xxyy_map);
-    const panning_raw_new = drawn.getControlValue(3, .raw);
+    const panning_display_new = try drawn.getControlValue(3, .display);
+    const panning_xxyy_new = try drawn.getControlValue(3, .xxyy_map);
+    const panning_raw_new = try drawn.getControlValue(3, .raw);
 
     try expectEqual(64, panning_display_new);
     try expectEqual(0x6000, panning_xxyy_new);
@@ -1815,7 +1867,7 @@ test "Pattern Test" {
     var slot = try Slot.create(allocator);
     defer slot.destroy() catch {};
 
-    const pattern = Pattern.fetchFromSlotByID(slot, 0);
+    const pattern = Pattern.fetchFromSlotByID(&slot, 0);
     try std.testing.expect(pattern != null);
     try expectEqual(32, pattern.?.getAllocatedLineCount());
     try expectEqual(4, pattern.?.getAllocatedTrackCount());
@@ -1841,3 +1893,22 @@ test "Pattern Test" {
     // Thus, this is the reason why I have getActiveXXXCount functions
     // so that you can get the dimension that is actually played during playback.
 }
+
+// test "Save To Memory Test" {
+//     _ = try init(null, 44100, 2, 0);
+//     defer deinit();
+
+//     const allocator = std.testing.allocator;
+//     var slot = try Slot.create(allocator);
+//     defer slot.destroy() catch {};
+
+//     const project = try slot.Project.saveToMemory(allocator);
+//     defer if (project) |proj| allocator.free(proj);
+
+//     if (project) |proj| {
+//         // The file will be valid if it starts from SVOX
+//         try std.testing.expectStringStartsWith(proj, "SVOX");
+//     } else {
+//         @panic("sunvox project is null");
+//     }
+// }
