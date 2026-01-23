@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const target = @import("zunvox_target");
+
 const assert = std.debug.assert;
 
 const expectEqual = std.testing.expectEqual;
@@ -601,7 +603,16 @@ pub const ModuleType = enum(u8) {
 /// This combines the original sv_load_dll() and sv_init() function because
 /// these two functions are mandatory for putting the dynamic library in action
 pub fn init(config: ?[]u8, freq: u32, channels: u32, flags: u32) !SunVoxVersion {
-    dll = try std.DynLib.open("sunvox");
+    var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer arena.deinit();
+
+    switch (target.zunvox_target_os) {
+        .windows => dll = try std.DynLib.open("sunvox"),
+        .linux => dll = try std.DynLib.open("./sunvox.so"),
+        .macos => dll = try std.DynLib.open("./sunvox.dylib"),
+        else => @panic("Architecture Not Supported"),
+    }
+
     sv = SunVoxFunctionTable{
         .sv_audio_callback = dll.lookup(tsv_audio_callback, "sv_audio_callback") orelse return error.Missing_tsv_audio_callback,
         .sv_audio_callback2 = dll.lookup(tsv_audio_callback2, "sv_audio_callback2") orelse return error.Missing_tsv_audio_callback2,
@@ -1472,19 +1483,26 @@ pub const Pattern = opaque {
         return pattern;
     }
 
-    pub fn new(slot: *Slot, clone: ?*Pattern, x: i32, y: i32, track_cnt: u32, line_cnt: u32, icon_seed: ?i32, pattern_name: ?[:0]u32) !*Pattern {
+    pub fn new(slot: *Slot, clone: ?*Pattern, x: i32, y: i32, track_cnt: u32, line_cnt: u32, icon_seed: ?i32, pattern_name: ?[:0]u8) !*Pattern {
         if (!slot._info.isLocked()) return SvError.LockRequired;
 
         const auto_icon_seed: c_int = if (icon_seed) |isd| @intCast(isd) else std.crypto.random.int(c_int);
         const result = sv.sv_new_pattern(
             slot._info.getSlotId(),
-            if (clone) |cln| @intCast(cln) else -1,
+            blk: {
+                if (clone) |cln| {
+                    const info: *PatternPrivateField = @ptrCast(@alignCast(cln));
+                    break :blk info.pattern_id;
+                } else {
+                    break :blk -1;
+                }
+            },
             @intCast(x),
             @intCast(y),
             @intCast(track_cnt),
             @intCast(line_cnt),
             auto_icon_seed,
-            pattern_name,
+            @ptrCast(if (pattern_name) |pat_n| pat_n else null),
         );
 
         if (result < 0) return SvError.FailedToCreatePattern;
@@ -1513,7 +1531,7 @@ pub const Pattern = opaque {
     // Member functions
     pub fn remove(self: *Pattern) !void {
         const info: *PatternPrivateField = @ptrCast(@alignCast(self));
-        if (!info._info.isLocked()) return SvError.LockRequired;
+        if (!info.slot_info.isLocked()) return SvError.LockRequired;
 
         if (sv.sv_remove_pattern(info.slot_info.getSlotId(), info.pattern_id) < 0) return SvError.FailedToRemovePattern;
         _ = info.slot_info.removePattern(info.pattern_id);
@@ -1630,7 +1648,7 @@ test "init sunvox library; create and destory SunVox Instances" {
     defer deinit();
     try expectEqual(2, version.detail.major);
     try expectEqual(1, version.detail.minor);
-    try expectEqual(2, version.detail.bug_fix);
+    try expectEqual(4, version.detail.bug_fix);
 
     // Validate Systemwise functions
     const sample_rate = try getSampleRate();

@@ -33,11 +33,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const zunvox_target = b.addOptions();
+    zunvox_target.addOption(std.Target.Os.Tag, "zunvox_target_os", target.result.os.tag);
+    zunvox_target.addOption(std.Target.Cpu.Arch, "zunvox_target_cpu_arch", target.result.cpu.arch);
+
     const zunvox = b.addModule("zunvox", .{
         .root_source_file = b.path("src/zunvox.zig"),
         .target = target,
         .link_libc = true,
     });
+
+    zunvox.addOptions("zunvox_target", zunvox_target);
 
     // let's only consider 64bit windows first before moving onto other systems
     const src, const dest = getSunVoxLibraryPath(target.result);
@@ -58,6 +64,7 @@ pub fn build(b: *std.Build) void {
     });
 
     tests.root_module.addImport("zunvox", zunvox);
+    tests.root_module.addOptions("zunvox_target", zunvox_target);
     b.installArtifact(tests);
 
     var test_step_run = b.addRunArtifact(tests);
